@@ -2,6 +2,10 @@
 
 > 每台电脑一个独立节点，无中心服务器、无需 Python、无需外网。
 > 主成品：**`dist\LanExcel.exe`**（单文件），拷到每台电脑双击即用。
+>
+> 仓库：<https://github.com/fj9876/Excel-Collaboration> · 成品直接下载：
+> [`dist/LanExcel.exe`](dist/LanExcel.exe)（14 MB，Win7~11 通用）·
+> [`dist/LanExcel_win10.exe`](dist/LanExcel_win10.exe)（37 MB，Win10/11 现代版）
 
 ---
 

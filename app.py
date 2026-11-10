@@ -24,6 +24,7 @@ from node import Node, now_ns, CONFIG_PATH            # noqa: E402
 from avatars import (CARTOON_COUNT, avatar_b64, cartoon_b64,   # noqa: E402
                      custom_avatar_b64)
 from collab import human_size                        # noqa: E402
+from emojis import EMOJI_GROUPS, TEXT_FACES          # noqa: E402
 from sheetstyle import describe as style_summary     # noqa: E402
 from styled_sheet import StyledSheet                 # noqa: E402
 
@@ -32,10 +33,19 @@ from tkinter import ttk, messagebox, filedialog, simpledialog   # noqa: E402
 from ui_compat import (init_theme, make_button, make_card,      # noqa: E402
                        make_sheet, make_photo, FONT, LEGACY)
 
+try:
+    from PIL import Image, ImageTk                    # noqa: E402
+except ImportError:                                   # Pillow 缺失时表情面板仍可用
+    Image = ImageTk = None
+
 SHEET_ROWS, SHEET_COLS = 60, 26
 NAV_ITEMS = [("sheet", "协作表格"), ("chat", "局域网群聊"),
              ("peers", "在线成员"), ("net", "跨网段联机"),
              ("profile", "我的资料")]
+
+ONLINE_FG = "#1A7A3C"     # 在线：深绿
+OFFLINE_FG = "#9A9A9A"    # 离线：灰
+CHAT_IMG_MAX = 240        # 聊天图片最长边（像素）
 
 
 def col_name(c):
@@ -88,6 +98,9 @@ class LanExcelApp:
         self.group_data = []
         self._rendered_mids = set()
         self._need_rebuild = False
+        self._chat_images = []        # PhotoImage 引用，防止被垃圾回收
+        self._anim_jobs = []          # GIF 动图动画任务
+        self.tag_filter = tk.StringVar(value="全部")
 
         root.title("LanExcel · 内网去中心化 Excel 协作 v3")
         root.geometry("1280x800")
@@ -228,11 +241,14 @@ class LanExcelApp:
         self.group_list = tk.Listbox(left, height=16, activestyle="none")
         self.group_list.pack(fill="both", expand=True, pady=(0, 8))
         self.group_list.bind("<<ListboxSelect>>", self.on_group_select)
+        self.group_list.bind("<Button-3>", self._group_menu)
         make_button(left, "新建群聊", self.create_group, True).pack(fill="x", pady=2)
         make_button(left, "邀请成员进群", self.invite_members).pack(fill="x", pady=2)
         make_button(left, "群设置 / 管理", self.show_group_settings).pack(fill="x", pady=2)
+        self.pin_btn = make_button(left, "置顶该群", self.toggle_pin_group)
+        self.pin_btn.pack(fill="x", pady=2)
         make_button(left, "刷新", self.refresh_chat).pack(fill="x", pady=2)
-        ttk.Label(left, text="提示：群内发的协作表格\n只有群成员能看到和编辑",
+        ttk.Label(left, text="右键群名可置顶 / 设置\n提示：群内发的协作表格\n只有群成员能看到和编辑",
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
 
         center = ttk.Frame(f, padding=(8, 0))
@@ -261,6 +277,7 @@ class LanExcelApp:
         self.chat_entry = ttk.Entry(entry, textvariable=self.chat_input)
         self.chat_entry.pack(side="left", fill="x", expand=True)
         self.chat_entry.bind("<Return>", lambda e: self.send_chat_text())
+        make_button(entry, "😊 表情", self.show_emoji_picker).pack(side="left", padx=(6, 0))
         make_button(entry, "发送", self.send_chat_text, True).pack(side="left", padx=6)
         self.atall_btn = make_button(entry, "@所有人", self.send_at_all)
         self.atall_btn.pack(side="left", padx=(0, 6))
@@ -269,7 +286,8 @@ class LanExcelApp:
         tools.pack(fill="x")
         for text, cmd in [("发送协作表格", self.send_sheet_card),
                           ("本地表格转协作表", self.send_local_sheet),
-                          ("发送文件到群", self.send_file_group)]:
+                          ("发送文件到群", self.send_file_group),
+                          ("发送图片(GIF动图)", self.send_image_group)]:
             make_button(tools, text, cmd).pack(side="left", padx=(0, 6))
         ttk.Label(tools, text="群内表格仅成员可见 · 文件不限大小 · 右键消息可撤回",
                   style="Muted.TLabel").pack(side="left", padx=6)
@@ -296,10 +314,17 @@ class LanExcelApp:
     def _build_peers_tab(self):
         f = self._page("peers")
         card = make_card(f, "自动发现的同伴",
-                         "启动即扫描本网段与已添加的网段；组播不通时用 register 定向探测。",
+                         "启动即扫描本网段与已添加的网段；组播不通时用 register 定向探测。"
+                         "支持给联系人打标签分组、置顶，在线/离线一目了然。",
                          "search")
         card.pack(fill="x", pady=(0, 10))
         make_button(card.actions, "立即扫描", self.scan_now, True).pack(side="left")
+        ttk.Label(card.actions, text="显示分组:", style="Muted.TLabel").pack(
+            side="left", padx=(14, 0))
+        self.tag_cb = ttk.Combobox(card.actions, textvariable=self.tag_filter,
+                                   state="readonly", width=14)
+        self.tag_cb.pack(side="left", padx=4)
+        self.tag_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_peers(True))
 
         cols = ("name", "note", "local_note", "ip", "source", "status")
         self.peer_tree = ttk.Treeview(f, columns=cols, show="tree headings", height=14)
@@ -307,7 +332,7 @@ class LanExcelApp:
         self.peer_tree.column("#0", width=64, stretch=False)
         heads = {"name": ("显示名称", 140), "note": ("对方备注", 160),
                  "local_note": ("我的备注", 160), "ip": ("IP 地址", 125),
-                 "source": ("发现方式", 88), "status": ("状态", 66)}
+                 "source": ("发现方式", 88), "status": ("状态", 90)}
         for c in cols:
             self.peer_tree.heading(c, text=heads[c][0])
             self.peer_tree.column(c, width=heads[c][1], anchor="w")
@@ -315,18 +340,80 @@ class LanExcelApp:
         vs = ttk.Scrollbar(f, orient="vertical", command=self.peer_tree.yview)
         vs.pack(side="left", fill="y")
         self.peer_tree.configure(yscrollcommand=vs.set)
+        # 在线绿色 / 离线灰色
+        self.peer_tree.tag_configure("online", foreground=ONLINE_FG)
+        self.peer_tree.tag_configure("offline", foreground=OFFLINE_FG)
 
         side = ttk.Frame(f, padding=(10, 0, 0, 0))
         side.pack(side="left", fill="y")
         for text, cmd in [("给选中同伴写备注", self.edit_peer_note),
+                          ("设置标签 / 置顶", self.edit_peer_tags),
                           ("发送文件给选中成员", self.send_file_to_peer),
                           ("邀请进当前群", self.invite_members),
                           ("收藏选中 IP", self.favorite_selected),
                           ("刷新", self.refresh_peers)]:
             make_button(side, text, cmd).pack(fill="x", pady=3)
-        ttk.Label(side, text="提示：\n· 对方备注 = 对方自己填\n· 我的备注 = 仅本机可见\n"
+        ttk.Label(side, text="提示：\n· ● 在线 / ○ 离线\n· 对方备注 = 对方自己填\n"
+                            "· 我的备注与标签仅本机可见\n· 右键群聊列表可置顶群聊\n"
                             "· 双击传输记录可打开文件",
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=12)
+
+    def _selected_peer(self):
+        """选中的必须是联系人（而不是分组节点）时返回其 id"""
+        sel = self.peer_tree.selection()
+        if not sel:
+            return ""
+        pid = sel[0]
+        if pid.startswith("grp:"):
+            return ""
+        with self.node.peers_lock:
+            return pid if pid in self.node.peers else ""
+
+    def edit_peer_tags(self):
+        """给联系人设置标签分组（逗号分隔）与置顶"""
+        pid = self._selected_peer()
+        if not pid:
+            self._alert("请先在列表中选中一位联系人（不能选分组标题行）")
+            return
+        tags_map = dict(self.node.cfg.get("peer_tags", {}))
+        pins = list(self.node.cfg.get("pinned_peers", []))
+        with self.node.peers_lock:
+            name = (self.node.peers.get(pid) or {}).get("name") or pid[:8]
+        all_tags = sorted({t for tl in tags_map.values() for t in tl})
+        top = tk.Toplevel(self.root)
+        top.title("联系人标签 / 置顶 · " + name)
+        top.geometry("380x260")
+        top.transient(self.root)
+        top.grab_set()
+        ttk.Label(top, text="联系人: %s" % name,
+                  font=(FONT, 11, "bold")).pack(anchor="w", padx=16, pady=(14, 2))
+        ttk.Label(top, text="已有标签: " + ("、".join(all_tags) if all_tags else "（暂无）"),
+                  style="Muted.TLabel").pack(anchor="w", padx=16)
+        ttk.Label(top, text="标签（多个用逗号分隔，留空清除全部标签）:",
+                  style="Muted.TLabel").pack(anchor="w", padx=16, pady=(10, 2))
+        old = "、".join(tags_map.get(pid, []))
+        var = tk.StringVar(value=old.replace("、", ","))
+        ttk.Entry(top, textvariable=var, width=36).pack(padx=16, fill="x")
+        pin_var = tk.BooleanVar(value=pid in pins)
+        ttk.Checkbutton(top, text="置顶该联系人（排到列表最前）",
+                        variable=pin_var).pack(anchor="w", padx=16, pady=(12, 0))
+
+        def save():
+            tags = [t.strip() for t in var.get().replace("，", ",").split(",")]
+            tags = [t for t in tags if t]
+            if tags:
+                tags_map[pid] = tags
+            else:
+                tags_map.pop(pid, None)
+            if pin_var.get() and pid not in pins:
+                pins.append(pid)
+            elif not pin_var.get() and pid in pins:
+                pins.remove(pid)
+            self.node.update_config({"peer_tags": tags_map, "pinned_peers": pins})
+            top.destroy()
+            self.refresh_peers(True)
+
+        make_button(top, "保存", save, True).pack(pady=12)
 
     # ------------------------------------------------------------ 跨网段
     def _build_network_tab(self):
@@ -669,6 +756,8 @@ class LanExcelApp:
             if kind == "file":
                 t.insert("end", "  [已撤回] %s 撤回了一个文件（%s）\n\n"
                          % (who, m.get("file", "")), "recalled")
+            elif kind == "image":
+                t.insert("end", "  [已撤回] %s 撤回了一张图片\n\n" % who, "recalled")
             else:
                 t.insert("end", "  [已撤回] %s 撤回了一条消息\n\n" % who, "recalled")
         elif kind == "text":
@@ -684,6 +773,35 @@ class LanExcelApp:
             t.insert("end", "  打开这张协作表格\n\n", ("link", tag))
             t.tag_bind(tag, "<Button-1>",
                        lambda e, r=m.get("room", ""): self.jump_to_sheet(r))
+        elif kind == "image":
+            t.insert("end", "  [图片] %s · %s\n"
+                     % (m.get("file", ""), human_size(m.get("size"))), "body")
+            path = m.get("path", "")
+            photo, anim_scale = self._load_chat_image(path)
+            if photo is not None:
+                t.insert("end", "  ")
+                mark = "imgmark_%s" % m.get("seq")
+                t.mark_set(mark, "end-1c")
+                t.mark_gravity(mark, "left")
+                t.image_create("end", image=photo)
+                if anim_scale:
+                    self._start_gif(mark, path, anim_scale)
+                t.insert("end", "\n")
+                if os.path.exists(path):
+                    tag = "img_%s" % m.get("seq")
+                    t.insert("end", "  查看原图\n\n", ("link", tag))
+                    t.tag_bind(tag, "<Button-1>",
+                               lambda e, p=path: self.open_path(p))
+                else:
+                    t.insert("end", "  （等待接收完成）\n\n", "muted")
+            elif path and os.path.exists(path):
+                t.insert("end", "  （图片格式暂不支持预览）\n\n", "muted")
+                tag = "img_%s" % m.get("seq")
+                t.insert("end", "  打开此图片\n\n", ("link", tag))
+                t.tag_bind(tag, "<Button-1>",
+                           lambda e, p=path: self.open_path(p))
+            else:
+                t.insert("end", "  （图片未接收或已被清理）\n\n", "muted")
         elif kind == "file":
             t.insert("end", "  [文件] %s · %s\n"
                      % (m.get("file", ""), human_size(m.get("size"))), "body")
@@ -702,6 +820,182 @@ class LanExcelApp:
         t.configure(state="disabled")
         t.see("end")
 
+    # ------------------------------------------------ 聊天图片 / GIF 动图
+    def _load_chat_image(self, path):
+        """加载聊天图片：返回 (PhotoImage, GIF动图缩放比 或 None)"""
+        if Image is None or not path or not os.path.isfile(path):
+            return None, None
+        try:
+            img = Image.open(path)
+        except Exception:
+            return None, None
+        try:
+            frames = int(getattr(img, "n_frames", 1) or 1)
+        except Exception:
+            frames = 1
+        animated = (img.format or "").upper() == "GIF" and frames > 1
+        w, h = img.size
+        scale = min(1.0, float(CHAT_IMG_MAX) / max(w, h)) if max(w, h) > CHAT_IMG_MAX else 1.0
+        if animated:
+            try:
+                return self._gif_frame(img, 0, scale), scale
+            except Exception:
+                return None, None
+        try:
+            size = (max(1, int(w * scale)), max(1, int(h * scale)))
+            ph = ImageTk.PhotoImage(img.convert("RGBA").resize(size), master=self.root)
+            self._chat_images.append(ph)
+            if len(self._chat_images) > 400:
+                del self._chat_images[:200]
+            return ph, None
+        except Exception:
+            return None, None
+
+    def _gif_frame(self, img, idx, scale):
+        img.seek(idx)
+        frame = img.convert("RGBA")
+        size = (max(1, int(frame.size[0] * scale)),
+                max(1, int(frame.size[1] * scale)))
+        ph = ImageTk.PhotoImage(frame.resize(size), master=self.root)
+        self._chat_images.append(ph)
+        if len(self._chat_images) > 400:
+            del self._chat_images[:200]
+        return ph
+
+    def _start_gif(self, mark, path, scale=1.0):
+        """在聊天窗口里循环播放 GIF 动图（最多同时 12 个动画）"""
+        if Image is None or len(self._anim_jobs) >= 12:
+            return
+        try:
+            img = Image.open(path)
+            n = int(img.n_frames)
+        except Exception:
+            return
+        st = {"mark": mark, "img": img, "n": n, "idx": 0, "scale": scale, "job": None}
+        self._anim_jobs.append(st)
+        self._gif_tick(st)
+
+    def _gif_tick(self, st):
+        try:
+            ph = self._gif_frame(st["img"], st["idx"], st.get("scale", 1.0))
+            self.chat_text.image_configure(st["mark"], image=ph)
+            st["img"].seek(st["idx"])
+            delay = int(st["img"].info.get("duration", 100) or 100)
+            st["idx"] = (st["idx"] + 1) % st["n"]
+            st["job"] = self.root.after(max(delay, 50),
+                                        lambda: self._gif_tick(st))
+        except Exception:
+            st["job"] = None
+
+    def _cancel_anims(self):
+        for st in self._anim_jobs:
+            job = st.get("job")
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+        self._anim_jobs = []
+
+    # ------------------------------------------------ 表情面板
+    def show_emoji_picker(self):
+        top = tk.Toplevel(self.root)
+        top.title("选择表情（点击插入输入框）")
+        top.geometry("440x320")
+        top.transient(self.root)
+        cat_row = ttk.Frame(top)
+        cat_row.pack(fill="x", padx=8, pady=(8, 4))
+        grid = tk.Frame(top)
+        grid.pack(fill="both", expand=True, padx=8)
+        cat_btns = []
+
+        def show_cat(i):
+            for j, b in enumerate(cat_btns):
+                try:
+                    b.configure(style="Primary.TButton" if j == i else "TButton")
+                except Exception:
+                    pass
+            for w in grid.winfo_children():
+                w.destroy()
+            chars = list(EMOJI_GROUPS[i][1])
+            cols = 12
+            for idx, ch in enumerate(chars):
+                b = tk.Button(grid, text=ch, relief="flat", bd=0,
+                              font=("Segoe UI Emoji", 12), cursor="hand2",
+                              command=lambda c=ch: self._insert_emoji(c, top))
+                b.grid(row=idx // cols, column=idx % cols, padx=1, pady=1)
+
+        for i, (name, _) in enumerate(EMOJI_GROUPS):
+            b = make_button(cat_row, name, lambda i=i: show_cat(i))
+            b.pack(side="left", padx=2)
+            cat_btns.append(b)
+        show_cat(0)
+        hint = ttk.Frame(top)
+        hint.pack(fill="x", padx=8, pady=(4, 8))
+        ttk.Label(hint, text="颜文字: " + "  ".join(TEXT_FACES[:6]),
+                  style="Muted.TLabel").pack(anchor="w")
+
+    def _insert_emoji(self, ch, top=None):
+        pos = self.chat_entry.index("insert")
+        cur = self.chat_input.get()
+        self.chat_input.set(cur[:pos] + ch + cur[pos:])
+        self.chat_entry.icursor(pos + len(ch))
+        self.chat_entry.focus_set()
+
+    def send_image_group(self):
+        if not self.current_gid:
+            self._alert("请先选中或新建一个群聊")
+            return
+        path = filedialog.askopenfilename(
+            title="选择要发送的图片（GIF 动图 / PNG / JPG / BMP）",
+            filetypes=[("图片", "*.gif;*.png;*.jpg;*.jpeg;*.bmp"),
+                       ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            r = self.node.send_file(path, gid=self.current_gid, image=True)
+            self._alert("已向 %d 位在线群成员发送图片 %s（%s）"
+                        % (len(r["targets"]), r["name"], human_size(r["size"])))
+        except Exception as e:
+            messagebox.showerror("发送失败", str(e))
+
+    # ------------------------------------------------ 群置顶
+    def _selected_gid(self):
+        sel = self.group_list.curselection()
+        if not sel or sel[0] >= len(self.group_ids):
+            return ""
+        return self.group_ids[sel[0]]
+
+    def toggle_pin_group(self, gid=None):
+        gid = gid or self._selected_gid() or self.current_gid
+        if not gid:
+            self._alert("请先选中一个群聊")
+            return
+        self.node.update_config({"toggle_pin_group": gid})
+        self._groups_sig = ""
+        self.refresh_chat()
+
+    def _group_menu(self, event):
+        idx = self.group_list.nearest(event.y)
+        if idx < len(self.group_ids):
+            self.group_list.selection_clear(0, "end")
+            self.group_list.selection_set(idx)
+            gid = self.group_ids[idx]
+            g = next((x for x in self.group_data if x["id"] == gid), None)
+            pinned = gid in self.node.cfg.get("pinned_groups", [])
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label="取消置顶" if pinned else "置顶该群",
+                             command=lambda: self.toggle_pin_group(gid))
+            if g and not g["dissolved"]:
+                menu.add_command(label="群设置 / 管理",
+                                 command=self.show_group_settings)
+                menu.add_command(label="邀请成员进群",
+                                 command=self.invite_members)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
     def _msg_menu(self, event, m):
         """消息右键：撤回（发送者本人或群管理员，不限时间）"""
         if m.get("kind") == "system":
@@ -710,12 +1004,15 @@ class LanExcelApp:
         if m.get("recalled"):
             menu.add_command(label="该消息已撤回", state="disabled")
         elif self.node.can_recall(m):
-            label = "撤回这个文件" if m.get("kind") == "file" else "撤回这条消息"
+            label = {"file": "撤回这个文件",
+                     "image": "撤回这张图片"}.get(m.get("kind"), "撤回这条消息")
             menu.add_command(label=label, command=lambda: self._do_recall(m))
         else:
             menu.add_command(label="只有发送者或群管理员可撤回", state="disabled")
-        if m.get("kind") == "file" and m.get("path") and os.path.exists(m["path"]):
-            menu.add_command(label="打开文件", command=lambda: self.open_path(m["path"]))
+        if m.get("kind") in ("file", "image") and m.get("path") \
+                and os.path.exists(m["path"]):
+            menu.add_command(label="打开文件" if m.get("kind") == "file" else "打开图片",
+                             command=lambda: self.open_path(m["path"]))
         if m.get("kind") == "sheet" and m.get("room"):
             menu.add_command(label="打开协作表格",
                              command=lambda: self.jump_to_sheet(m["room"]))
@@ -730,6 +1027,9 @@ class LanExcelApp:
             tip = ("确定撤回这个文件？\n"
                    "文件会同时从各成员已接收的下载目录中删除，\n"
                    "但已经被打开或另存到别处的副本无法收回。")
+        elif m.get("kind") == "image":
+            tip = ("确定撤回这张图片？\n"
+                   "图片会同时从各成员已接收的下载目录中删除。")
         if not messagebox.askyesno("撤回", tip, parent=self.root):
             return
         try:
@@ -741,6 +1041,7 @@ class LanExcelApp:
 
     def rebuild_chat(self):
         self._need_rebuild = False
+        self._cancel_anims()
         self.chat_text.configure(state="normal")
         self.chat_text.delete("1.0", "end")
         self.chat_text.configure(state="disabled")
@@ -755,24 +1056,31 @@ class LanExcelApp:
         d = self.node.chat_since(self.chat_since)
         self.chat_since = d["seq"]
         mine = [g for g in d["groups"] if g["mine"]]
+        # 置顶的群排到最前面
+        pins = self.node.cfg.get("pinned_groups", [])
+        mine = sorted(mine, key=lambda g: (0 if g["id"] in pins else 1,))
         self.group_data = mine
-        sig = json.dumps(mine, ensure_ascii=False, sort_keys=True)
+        sig = json.dumps([[g, g["id"] in pins] for g in mine],
+                         ensure_ascii=False, sort_keys=True)
         if sig != self._groups_sig:
             self._groups_sig = sig
             self.group_ids = [g["id"] for g in mine]
             self.group_list.delete(0, "end")
             for g in mine:
                 mark = ""
+                if g["id"] in pins:
+                    mark = " 📌"
                 if g["dissolved"]:
-                    mark = " ·已解散"
+                    mark += " ·已解散"
                 elif g["is_owner"]:
-                    mark = " ·群主"
+                    mark += " ·群主"
                 elif g["is_admin"]:
-                    mark = " ·管理"
+                    mark += " ·管理"
                 if g["can_manage"] and g["pending_count"]:
                     mark += " ·待审%d" % g["pending_count"]
-                self.group_list.insert("end", " %s (%d)%s"
-                                       % (g["name"], g["count"], mark))
+                self.group_list.insert("end", " %s%s (%d)"
+                                       % ("📌 " if g["id"] in pins else "",
+                                          g["name"], g["count"]) + mark)
             if self.current_gid in self.group_ids:
                 self.group_list.selection_set(self.group_ids.index(self.current_gid))
             elif mine:
@@ -782,6 +1090,17 @@ class LanExcelApp:
             else:
                 self.current_gid = ""
             self.refresh_members()
+            # 置顶按钮文字跟随状态
+            if self.current_gid in pins:
+                try:
+                    self.pin_btn.configure(text="取消置顶")
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.pin_btn.configure(text="置顶该群")
+                except Exception:
+                    pass
         for m in d["messages"]:
             self._append_message(m)
         if self._need_rebuild:
@@ -815,15 +1134,26 @@ class LanExcelApp:
             return
         owner = cur["owner"]
         admins = set(cur["admins"])
-        for pid in cur["members"]:
-            role = " [群主]" if pid == owner else (" [管理员]" if pid in admins else "")
+
+        def display_name(pid):
             if pid == self.node.id:
-                self.member_list.insert("end", " %s%s (我)" % (self.node.name, role))
-                continue
+                return "%s (我)" % self.node.name
             with self.node.peers_lock:
                 p = self.node.peers.get(pid, {})
-            self.member_list.insert("end", " %s%s"
-                                    % (p.get("name") or pid[:8], role))
+            return p.get("name") or pid[:8]
+
+        rows = []
+        for pid in cur["members"]:
+            online = pid == self.node.id or self.node._peer_online(pid)
+            role = " [群主]" if pid == owner else (" [管理员]" if pid in admins else "")
+            rows.append((not online, pid != owner and pid not in admins,
+                         display_name(pid), pid, online, role))
+        rows.sort(key=lambda x: (x[0], x[1], x[2]))
+        for _, _, name, pid, online, role in rows:
+            dot = "●" if online else "○"
+            self.member_list.insert("end", " %s %s%s" % (dot, name, role))
+            self.member_list.itemconfigure(
+                "end", foreground=ONLINE_FG if online else OFFLINE_FG)
 
     def on_group_select(self, event=None):
         sel = self.group_list.curselection()
@@ -879,7 +1209,11 @@ class LanExcelApp:
                 with self.node.peers_lock:
                     p = self.node.peers.get(pid, {})
                 name = p.get("name") or pid[:8]
-            member_box.insert("end", " %s%s" % (name, role_tag))
+            online = pid == self.node.id or self.node._peer_online(pid)
+            member_box.insert("end", " %s %s%s" % ("●" if online else "○",
+                                                   name, role_tag))
+            member_box.itemconfigure(
+                "end", foreground=ONLINE_FG if online else OFFLINE_FG)
 
         ops = ttk.Frame(left)
         ops.pack(fill="x", pady=(8, 0))
@@ -1172,11 +1506,10 @@ class LanExcelApp:
                     % (len(r["targets"]), r["name"], human_size(r["size"])))
 
     def send_file_to_peer(self):
-        sel = self.peer_tree.selection()
-        if not sel:
-            self._alert("请先在「在线成员」页选中一个成员")
+        pid = self._selected_peer()
+        if not pid:
+            self._alert("请先在「在线成员」页选中一位联系人")
             return
-        pid = sel[0]
         path = filedialog.askopenfilename(title="选择要发送的文件（不限大小）")
         if not path:
             return
@@ -1260,10 +1593,15 @@ class LanExcelApp:
             traceback.print_exc()
         self.root.after(800, self.refresh)
 
-    def refresh_peers(self):
+    def refresh_peers(self, force=False):
         peers = self.node.peers_detail()
-        sig = json.dumps(peers, ensure_ascii=False, sort_keys=True)
-        if sig == self._peers_sig:
+        tags_map = self.node.cfg.get("peer_tags", {})
+        pins = set(self.node.cfg.get("pinned_peers", []))
+        filt = self.tag_filter.get()
+        sig = json.dumps([peers, filt, sorted(pins),
+                          {k: sorted(v) for k, v in tags_map.items()}],
+                         ensure_ascii=False, sort_keys=True)
+        if not force and sig == self._peers_sig:
             return
         self._peers_sig = sig
         tree = self.peer_tree
@@ -1272,15 +1610,56 @@ class LanExcelApp:
             tree.delete(item)
         src = {"multicast": "组播", "broadcast": "广播",
                "register": "定向探测", "": "—"}
-        for p in peers:
+
+        # 组装分组：置顶 / 各标签 / 未分组；一个联系人有多个标签时会在每个标签下出现
+        sections = []
+        if filt in ("全部", "", "📌 置顶"):
+            pinned = [p for p in peers if p["id"] in pins]
+            if pinned:
+                sections.append(("📌 置顶", pinned))
+        if filt not in ("📌 置顶", "未分组"):
+            tag_groups = {}
+            for p in peers:
+                for t in tags_map.get(p["id"], []):
+                    tag_groups.setdefault(t, []).append(p)
+            for t in sorted(tag_groups):
+                if filt in ("全部", "", t):
+                    sections.append(("🏷 " + t, tag_groups[t]))
+        if filt in ("全部", "", "未分组"):
+            untagged = [p for p in peers
+                        if not tags_map.get(p["id"]) and p["id"] not in pins]
+            if untagged:
+                sections.append(("未分组", untagged))
+
+        def insert_peer(parent, p):
+            online = p["online"]
             photo = self._photo(p["id"], self.node.peer_avatar_b64(p["id"]))
             self._peer_photos[p["id"]] = photo
-            tree.insert("", "end", iid=p["id"], image=photo, values=(
-                p["name"], p["note"], p["local_note"], p["ip"],
-                src.get(p["source"], p["source"]),
-                "在线" if p["online"] else "离线"))
-        if selected and tree.exists(selected[0]):
-            tree.selection_set(selected[0])
+            tree.insert(parent, "end", iid=p["id"], image=photo,
+                        tags=("online" if online else "offline",),
+                        values=(p["name"], p["note"], p["local_note"], p["ip"],
+                                src.get(p["source"], p["source"]),
+                                "● 在线" if online else "○ 离线"))
+
+        for gname, members in sections:
+            tree.insert("", "end", iid="grp:" + gname, text=gname, open=True,
+                        values=("%d 人" % len(members), "", "", "", "", ""))
+            for p in sorted(members, key=lambda x: (not x["online"], x["name"])):
+                insert_peer("grp:" + gname, p)
+
+        # 更新筛选下拉选项
+        all_tags = sorted({t for tl in tags_map.values() for t in tl})
+        values = ["全部", "📌 置顶"] + all_tags + ["未分组"]
+        if list(self.tag_cb["values"]) != values:
+            self.tag_cb["values"] = values
+        if filt not in values:
+            self.tag_filter.set("全部")
+
+        if selected:
+            for iid in selected:
+                if tree.exists(iid) and not iid.startswith("grp:"):
+                    tree.selection_set(iid)
+                    break
 
     def refresh_lists(self):
         cfg = self.node.config_public()
@@ -1353,11 +1732,10 @@ class LanExcelApp:
         self._alert("已启动全网段扫描：组播 + 收藏设备 + 本网段 + 已添加网段")
 
     def edit_peer_note(self):
-        sel = self.peer_tree.selection()
-        if not sel:
-            self._alert("请先选中一个同伴")
+        pid = self._selected_peer()
+        if not pid:
+            self._alert("请先在列表中选中一位联系人")
             return
-        pid = sel[0]
         old = self.node.cfg.get("peer_notes", {}).get(pid, "")
         text = simpledialog.askstring("本地备注", "给这位同伴的备注（仅本机可见）:",
                                       initialvalue=old, parent=self.root)
@@ -1370,11 +1748,12 @@ class LanExcelApp:
         self.refresh_peers()
 
     def favorite_selected(self):
-        sel = self.peer_tree.selection()
-        if not sel:
-            self._alert("请先选中一个同伴")
+        pid = self._selected_peer()
+        if not pid:
+            self._alert("请先在列表中选中一位联系人")
             return
-        ip = self.peer_tree.item(sel[0], "values")[3]
+        with self.node.peers_lock:
+            ip = (self.node.peers.get(pid) or {}).get("ip", "")
         if ip:
             self.node.update_config({"add_favorite": ip})
             self.refresh_lists()

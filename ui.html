@@ -115,6 +115,21 @@
   .atall{color:#c42b1c; font-weight:600;}
   .msg .tools{font-size:11px; color:#a0a0a0; margin-left:8px; cursor:pointer;}
   .msg .tools:hover{color:#c42b1c; text-decoration:underline;}
+  /* ---------- 表情 / 图片 / 置顶 / 在线状态（v6） ---------- */
+  #emojipanel{display:none; border:1px solid var(--border); border-radius:6px; background:#fff;
+              padding:6px; margin:0 10px 6px; max-height:190px; overflow:auto;}
+  #emojipanel .cats{display:flex; gap:4px; flex-wrap:wrap; margin-bottom:5px;}
+  #emojipanel .cats button{padding:2px 8px; font-size:11px;}
+  #emojipanel .cats button.cur{background:var(--accent); color:#fff; border-color:var(--accent);}
+  #emojipanel .egrid{display:grid; grid-template-columns:repeat(12,1fr); font-size:17px;}
+  #emojipanel .egrid span{cursor:pointer; text-align:center; padding:2px 0;}
+  #emojipanel .egrid span:hover{background:var(--accent-soft);}
+  .msg img.chatimg{max-width:220px; max-height:220px; border-radius:6px; cursor:pointer;
+                   display:block; margin-top:4px; background:var(--head-bg);}
+  .msg .imgname{font-size:11px; color:var(--sub);}
+  .gonline{color:#1A7A3C;}
+  .goffline{color:#9a9a9a;}
+  #groupsel option.pinnedopt{color:#8a6d00;}
   /* ---------- 空状态 ---------- */
   #empty{margin:60px auto; text-align:center; color:var(--sub);}
   #empty h2{color:var(--text); margin-bottom:10px;}
@@ -189,10 +204,12 @@
     </div>
     <div id="gset" style="display:none"></div>
     <div id="chatmsg"></div>
+    <div id="emojipanel"></div>
     <div id="chatfoot">
       <div id="transferbox">文件传输进度：加载中…</div>
       <div class="row">
         <input type="text" id="chatin" placeholder="输入消息后回车发送" autocomplete="off">
+        <button class="mini" onclick="toggleEmoji()" title="表情">😊</button>
         <button class="primary mini" onclick="sendChatText()">发送</button>
         <button class="mini" onclick="sendAtAll()" title="仅群主/管理员可用">@所有人</button>
       </div>
@@ -200,6 +217,7 @@
         <button class="mini" onclick="sendSheetToGroup()">发送协作表格</button>
         <button class="mini" onclick="sendLocalXlsx()">本地表格→协作表</button>
         <button class="mini" onclick="sendFileToGroup()">发送文件到群</button>
+        <button class="mini" onclick="sendImageToGroup()">发送图片(GIF)</button>
       </div>
     </div>
   </div>
@@ -245,6 +263,8 @@ function loadConfig(){
     $("cfgname").value = c.name || "";
     $("cfgnote").value = c.note || "";
     $("cfgsubnets").textContent = "已添加网段: " + (c.subnets.length ? c.subnets.join(" / ") : "无");
+    pinGroups = c.pinned_groups || [];
+    updateGroupSelect();
   }).catch(()=>{});
 }
 function saveProfile(){
@@ -570,7 +590,58 @@ function saveXlsx(saveAs){
 /* ---------------- 局域网群聊 / 文件传输（v3） ---------------- */
 let chatSeq = 0, curGid = "", chatGroups = [];
 let msgSeen = new Set(), needRebuild = false;
+let pinGroups = [], onlineMap = {};       // v6: 置顶群 / 成员在线状态
 const avatarCache = {};
+const EMOJI_DATA = {
+  "笑脸":["😀","😃","😄","😁","😆","😅","🤣","😂","🙂","😉","😊","😇","🥰","😍","🤩","😘","😋","😜","🤪","🤗","🤭","🤔","😐","😏","😒","🙄","😬","😌","😔","😴","🤒","🤢","🥵","🥶","🤯","🥳","😎","🤓","😕","🙁","😮","😲","😳","🥺","😨","😢","😭","😱","😤","😡","🤬","😈","💀","🤡","👻","🤖"],
+  "手势":["👍","👎","👌","✌️","🤞","🤟","🤘","🤙","👈","👉","👆","👇","☝️","👋","✋","🖖","👏","🙌","🤲","🤝","🙏","💪","✍️","🤳","👊","🤛","🤜"],
+  "爱心":["❤️","🧡","💛","💚","💙","💜","🖤","🤍","💔","💕","💞","💓","💗","💖","💘","💝","💯","💢","💥","💫","💦","💬","💭","🔥","✨","🌟","⭐","🌈","☀️","🌙","⚡","❄️","🌸","🌹","🌻","🍀"],
+  "动物":["🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔","🐧","🐦","🐤","🦆","🦅","🦉","🐺","🐴","🦄","🐝","🦋","🐢","🐍","🐙","🦐","🦀","🐬","🐳","🦈"],
+  "美食":["🍏","🍎","🍐","🍊","🍋","🍌","🍉","🍇","🍓","🍒","🍑","🍍","🥝","🍅","🥑","🥦","🌽","🥕","🍞","🧀","🍳","🥓","🍔","🍟","🍕","🥪","🌮","🥗","🍜","🍝","🍣","🍱","🍚","🍲","🍰","🎂","🍭","🍫","🍩","☕","🍵","🧋","🍺","🍻","🥂"],
+  "活动":["⚽","🏀","🏈","⚾","🎾","🏐","🎱","🏓","🏸","🥊","⛳","🎿","🏂","🏋️","🚴","🏆","🥇","🥈","🥉","🎯","🎮","🎲","🧩","🎨","🎵","🎤","🎧","🎹","🥁","🎸","🎬"],
+  "物品":["📱","💻","🖥️","📷","📞","📺","⏰","💡","💰","💳","💎","🔧","💊","🚀","✈️","🚗","🏠","🏢","🛒","🎁","🎈","🎉","📮","📦"],
+  "符号":["✅","❌","❓","❗","‼️","⭕","🚫","♻️","⚠️","🔴","🟠","🟡","🟢","🔵","🟣","♠️","♥️","♦️","♣️","🔔","🔕","🆚","🆕","🆓","🆙","🆒","🆗","🆘"]
+};
+function toggleEmoji(){
+  const p = $("emojipanel");
+  if(p.style.display === "block"){ p.style.display = "none"; return; }
+  p.style.display = "block";
+  renderEmoji("笑脸");
+}
+function renderEmoji(cat){
+  const p = $("emojipanel");
+  p.innerHTML = "";
+  const cats = document.createElement("div"); cats.className = "cats";
+  Object.keys(EMOJI_DATA).forEach(c=>{
+    const b = document.createElement("button");
+    b.textContent = c;
+    if(c === cat) b.className = "cur";
+    b.onclick = ()=>renderEmoji(c);
+    cats.appendChild(b);
+  });
+  p.appendChild(cats);
+  const grid = document.createElement("div"); grid.className = "egrid";
+  EMOJI_DATA[cat].forEach(ch=>{
+    const s = document.createElement("span");
+    s.textContent = ch;
+    s.onclick = ()=>{
+      const inp = $("chatin");
+      inp.value = (inp.value || "") + ch;
+      inp.focus();
+    };
+    grid.appendChild(s);
+  });
+  p.appendChild(grid);
+}
+function sendImageToGroup(){
+  if(!needGroup()) return;
+  const p = prompt("输入要发送的图片完整路径（GIF 动图会动起来）:","");
+  if(!p) return;
+  post("/api/chat/send",{gid:curGid,kind:"image",path:p}).then(d=>{
+    if(!d.ok){ toast("发送失败: "+d.error); return; }
+    toast("已向 "+(d.targets||[]).length+" 位在线群成员发送图片");
+  });
+}
 function toggleChat(){ $("chatpanel").classList.toggle("open"); if($("chatpanel").classList.contains("open")) pollChat(); }
 function needGroup(){ if(!curGid){ toast("请先新建或选择一个群聊"); return false; } return true; }
 function curGroup(){ return chatGroups.find(g=>g.id===curGid) || null; }
@@ -606,6 +677,9 @@ function fetchAvatar(pid){
 }
 function updateGroupSelect(){
   const s = $("groupsel");
+  // 置顶的群排到最前面
+  chatGroups = [...chatGroups].sort((a,b)=>
+    (pinGroups.includes(b.id) - pinGroups.includes(a.id)));
   const ids = chatGroups.map(g=>g.id);
   if(ids.length && !ids.includes(curGid)) curGid = ids[0];
   s.innerHTML = chatGroups.map(g=>{
@@ -614,7 +688,8 @@ function updateGroupSelect(){
     else if(g.is_owner) mark = " ·群主";
     else if(g.is_admin) mark = " ·管理";
     if(g.can_manage && g.pending_count) mark += " ·待审"+g.pending_count;
-    return `<option value="${g.id}">${g.name} (${g.count})${mark}</option>`;
+    const pin = pinGroups.includes(g.id) ? "📌 " : "";
+    return `<option value="${g.id}" class="${pin?'pinnedopt':''}">${pin}${g.name} (${g.count})${mark}</option>`;
   }).join("") || "<option value=''>— 暂无群聊 —</option>";
   if(curGid) s.value = curGid;
 }
@@ -637,7 +712,7 @@ function appendMsg(m){
   body.appendChild(who); body.appendChild(tm);
   if(canRecall(m)){
     const tool = document.createElement("span"); tool.className="tools";
-    tool.textContent = m.kind==="file" ? "撤回文件" : "撤回";
+    tool.textContent = m.kind==="file" ? "撤回文件" : (m.kind==="image" ? "撤回图片" : "撤回");
     tool.onclick = ()=>recallMsg(m);
     body.appendChild(tool);
   }
@@ -647,7 +722,9 @@ function appendMsg(m){
     const by = m.recalled_by_name || m.from_name || "同伴";
     s.textContent = m.kind==="file"
       ? "[已撤回] "+by+" 撤回了一个文件（"+(m.file||"")+"）"
-      : "[已撤回] "+by+" 撤回了一条消息";
+      : (m.kind==="image"
+        ? "[已撤回] "+by+" 撤回了一张图片"
+        : "[已撤回] "+by+" 撤回了一条消息");
     body.appendChild(s);
   } else if(m.kind==="system"){
     const s=document.createElement("span"); s.className="sys"; s.textContent=m.text||""; body.appendChild(s);
@@ -657,6 +734,17 @@ function appendMsg(m){
       body.appendChild(a);
     }
     const txt=document.createElement("span"); txt.textContent=m.text||""; body.appendChild(txt);
+    if(m.kind==="image" && m.id){
+      body.appendChild(document.createElement("br"));
+      const img=document.createElement("img");
+      img.className="chatimg"; img.alt=m.file||"图片";
+      img.src="/api/chat/image?mid="+encodeURIComponent(m.id);
+      img.onclick=()=>window.open(img.src);
+      body.appendChild(img);
+      const nm=document.createElement("span"); nm.className="imgname";
+      nm.textContent=(m.file||"")+" · "+(m.size?(Math.round(m.size/1024))+" KB":"");
+      body.appendChild(nm);
+    }
     if(m.kind==="sheet" && m.room){
       body.appendChild(document.createElement("br"));
       const a=document.createElement("a"); a.className="link";
@@ -702,6 +790,7 @@ function renderTransfers(list){
 function pollChat(){
   fetch("/api/chat?since="+chatSeq).then(r=>r.json()).then(d=>{
     chatSeq=d.seq;
+    onlineMap = d.online || {};
     const sig = JSON.stringify((chatGroups||[]).map(g=>[g.id,g.rev,g.pending_count,g.join_mode,g.dissolved,g.is_admin]));
     chatGroups=(d.groups||[]).filter(g=>g.mine);
     updateGroupSelect();
@@ -720,14 +809,28 @@ function openGroupSettings(){
   box.style.display = "block";
   renderGroupSettings();
 }
+function refreshPins(){
+  return fetch("/api/config").then(r=>r.json()).then(c=>{
+    pinGroups = c.pinned_groups || [];
+    updateGroupSelect();
+  }).catch(()=>{});
+}
+function togglePinGroup(){
+  post("/api/config",{toggle_pin_group:curGid}).then(refreshPins);
+}
 function renderGroupSettings(){
   const box = $("gset"); const g = curGroup();
   box.innerHTML = "";
   if(!g){ box.textContent = "群资料同步中…"; return; }
   const h4 = document.createElement("h4");
-  h4.textContent = g.name+" · "+g.count+" 人 · 我是"+
+  h4.textContent = (pinGroups.includes(g.id)?"📌 ":"")+g.name+" · "+g.count+" 人 · 我是"+
                    (g.is_owner?"群主":(g.is_admin?"管理员":"成员"));
   box.appendChild(h4);
+  const pinB=document.createElement("button");
+  pinB.textContent = pinGroups.includes(g.id) ? "★ 取消置顶" : "☆ 置顶该群";
+  pinB.style.marginBottom = "6px";
+  pinB.onclick = togglePinGroup;
+  box.appendChild(pinB);
   if(g.dissolved){
     const p=document.createElement("div"); p.className="hint";
     p.textContent="该群已解散：只能查看历史消息，群内协作表格已失效。";
@@ -756,16 +859,25 @@ function renderGroupSettings(){
       r.appendChild(okB); r.appendChild(noB); box.appendChild(r);
     });
   }
-  const mh=document.createElement("h4"); mh.textContent="群成员";
+  const mh=document.createElement("h4"); mh.textContent="群成员（● 在线 / ○ 离线）";
   mh.style.marginTop="8px"; box.appendChild(mh);
   const meId = (typeof me !== "undefined" && me) ? me.id : "";
   const admins = g.admins || [];
-  (g.members||[]).forEach(pid=>{
+  // 群主/管理员排前，在线排前，离线灰色
+  const sortedMembers = [...(g.members||[])].sort((a,b)=>{
+    const ra = a===g.owner?0:(admins.includes(a)?1:2);
+    const rb = b===g.owner?0:(admins.includes(b)?1:2);
+    if(ra!==rb) return ra-rb;
+    return (onlineMap[b]?1:0) - (onlineMap[a]?1:0);
+  });
+  sortedMembers.forEach(pid=>{
     const r=document.createElement("div"); r.className="grow";
     const s=document.createElement("span");
+    const online = pid===meId || !!onlineMap[pid];
     let nm = String(pid).slice(0,8);
     if(meId && pid===meId) nm = (me.name||"我")+"（我）";
-    s.textContent = nm;
+    s.textContent = (online?"● ":"○ ")+nm;
+    s.className = online ? "gonline" : "goffline";
     r.appendChild(s);
     const tag=document.createElement("span"); tag.className="tag";
     tag.textContent = pid===g.owner ? "群主" : (admins.includes(pid) ? "管理员" : "");

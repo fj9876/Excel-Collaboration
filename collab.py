@@ -592,6 +592,21 @@ class CollabMixin:
         with self.chat_lock:
             if mid and mid in self.chat_seen:
                 return False
+            # 文件/图片：同一次传输（transfer）只保留一张卡片，避免
+            # 「发送者广播卡片 + 本地接收卡片」重复显示。路径合并由
+            # _recv_file_worker 收完文件后显式写入（本地路径最权威）。
+            tr = msg.get("transfer")
+            if tr and msg.get("kind") in ("file", "image"):
+                for m in self.chat_log:
+                    if (m.get("transfer") == tr
+                            and m.get("kind") == msg.get("kind")
+                            and m.get("gid") == msg.get("gid")):
+                        if msg.get("path") and not (m.get("path")
+                                                    and os.path.isfile(m["path"])):
+                            m["path"] = msg["path"]
+                            self.chat_seq += 1
+                            m["rev"] = self.chat_seq      # 让各端 UI 重绘拿到本地路径
+                        return False
             if mid:
                 self.chat_seen.add(mid)
             msg = dict(msg)
@@ -704,8 +719,8 @@ class CollabMixin:
         return {"ok": True, "mid": mid, "recalled": target is not None}
 
     def _delete_local_copy(self, msg):
-        """撤回文件时删除本机下载目录里的副本（只在自己的下载目录内动手）"""
-        if msg.get("kind") != "file":
+        """撤回文件/图片时删除本机下载目录里的副本（只在自己的下载目录内动手）"""
+        if msg.get("kind") not in ("file", "image"):
             return
         path = msg.get("path") or ""
         if not path:
@@ -851,9 +866,10 @@ class CollabMixin:
             p = self.peers.get(pid)
         return bool(p and time.time() - p.get("last_seen", 0) < 45)
 
-    def send_file(self, path, to=None, gid=None):
+    def send_file(self, path, to=None, gid=None, image=False):
         """发送文件：to=成员 id（单聊）或 gid=群 id（发给全体在线群成员）
         文件以 64KB 分块流式读取发送，接收端边收边写盘，内存占用恒定。
+        image=True 时以「图片卡片」形式发到群里，GIF 动图会动起来。
         """
         path = os.path.abspath(path)
         if not os.path.isfile(path):
@@ -875,19 +891,21 @@ class CollabMixin:
         else:
             raise ValueError("请指定接收成员或群聊")
         tid = uuid.uuid4().hex[:10]
+        kind = "image" if image else "file"
         if gid:
-            self._add_message(gid, "file",
-                              text="%s 发送了文件 %s（%s）"
+            self._add_message(gid, kind,
+                              text=("%s 发送了图片 %s（%s）" if image else
+                                    "%s 发送了文件 %s（%s）")
                                    % (self.name, name, human_size(size)),
                               file=name, size=size, path=path,
-                              transfer=tid, targets=len(targets))
+                              transfer=tid, targets=len(targets), image=1 if image else 0)
         for pid in targets:
             threading.Thread(target=self._send_file_worker,
-                             args=(path, pid, gid or "", tid, size, name),
+                             args=(path, pid, gid or "", tid, size, name, image),
                              daemon=True).start()
         return {"id": tid, "name": name, "size": size, "targets": targets}
 
-    def _send_file_worker(self, path, pid, gid, tid, size, name):
+    def _send_file_worker(self, path, pid, gid, tid, size, name, image=False):
         rec = {"id": tid + ":" + pid, "name": name, "size": size, "sent": 0,
                "status": "发送中", "direction": "send", "path": path,
                "peer": pid, "group": gid, "ts": time.time()}
@@ -906,7 +924,8 @@ class CollabMixin:
             meta = {"t": "file", "id": tid, "from": self.id,
                     "from_name": self.name, "avatar": self.avatar,
                     "avatar_data": avatar_b64(self.avatar, self.avatar_data),
-                    "name": name, "size": size, "group": gid, "ts": time.time()}
+                    "name": name, "size": size, "group": gid, "ts": time.time(),
+                    "image": 1 if image else 0}
             sock = socket.create_connection((ip, int(port)), timeout=10)
             sock.settimeout(120)
             sock.sendall((json.dumps(meta, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -973,18 +992,41 @@ class CollabMixin:
                 g = self.groups.get(gid) if gid else None
                 mine = bool(g and self.id in g["members"] and not g["dissolved"])
             if mine:
-                # 收件端本地生成一张文件卡片（不广播，其他人各自收各自的副本）
-                self._store_message({
-                    "id": "file:" + str(meta.get("id")) + ":" + self.id,
-                    "gid": gid, "ts": time.time(), "from": sender,
-                    "from_name": meta.get("from_name", "同伴"),
-                    "avatar": meta.get("avatar", ""),
-                    "avatar_data": meta.get("avatar_data", ""),
-                    "kind": "file",
-                    "text": "%s 发来文件 %s（%s）"
-                            % (meta.get("from_name", "同伴"), name, human_size(size)),
-                    "file": name, "size": size, "path": path,
-                    "transfer": meta.get("id", "")}, broadcast=False)
+                # 收件端本地生成/合并一张消息卡片（不广播，其他人各自收各自的副本）
+                is_img = bool(meta.get("image"))
+                tid = str(meta.get("id") or "")
+                kind = "image" if is_img else "file"
+                text = ("%s 发来图片 %s（%s）" if is_img else
+                        "%s 发来文件 %s（%s）") % (
+                    meta.get("from_name", "同伴"), name, human_size(size))
+                with self.chat_lock:
+                    dup = None
+                    for m in reversed(self.chat_log):
+                        if (m.get("kind") in ("file", "image")
+                                and m.get("transfer") == tid
+                                and m.get("gid") == gid):
+                            dup = m
+                            break
+                if dup is not None:
+                    # 广播卡片先到：把本地真实路径合并进去，撤回时才能删到本机副本
+                    with self.chat_lock:
+                        dup["path"] = path
+                        dup["file"] = name
+                        dup["size"] = size
+                        self.chat_seq += 1
+                        dup["rev"] = self.chat_seq
+                else:
+                    self._store_message({
+                        "id": "file:" + tid + ":" + self.id,
+                        "gid": gid, "ts": time.time(), "from": sender,
+                        "from_name": meta.get("from_name", "同伴"),
+                        "avatar": meta.get("avatar", ""),
+                        "avatar_data": meta.get("avatar_data", ""),
+                        "kind": kind,
+                        "text": text,
+                        "file": name, "size": size, "path": path,
+                        "image": 1 if is_img else 0,
+                        "transfer": tid}, broadcast=False)
             if self.on_file_received:
                 try:
                     self.on_file_received(path, meta)
@@ -1089,6 +1131,13 @@ class CollabMixin:
         return False
 
     # ------------------------------------------------------------ UI 轮询接口
+    def online_map(self):
+        """{peer_id: 是否在线}，给 UI 区分在线/离线显示"""
+        now = time.time()
+        with self.peers_lock:
+            return {pid: bool(now - p.get("last_seen", 0) < 45)
+                    for pid, p in self.peers.items()}
+
     def chat_since(self, seq=0):
         with self.groups_lock:
             mine_ids = set(g["id"] for g in self.groups.values()
@@ -1099,4 +1148,5 @@ class CollabMixin:
                     and m.get("gid") in mine_ids]
         return {"seq": self.chat_seq, "messages": msgs,
                 "groups": self.groups_public(),
+                "online": self.online_map(),
                 "transfers": self.transfer_list()}

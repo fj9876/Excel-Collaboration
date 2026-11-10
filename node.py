@@ -105,7 +105,8 @@ CONFIG_PATH = os.path.join(
 TEMPLATE_DIR = os.path.join(os.path.dirname(CONFIG_PATH), "lanexcel_templates")
 DEFAULT_CONFIG = {"name": "", "note": "", "fingerprint": "",
                   "subnets": [], "favorites": [], "peer_notes": {},
-                  "avatar": "", "avatar_data": "", "download_dir": ""}
+                  "avatar": "", "avatar_data": "", "download_dir": "",
+                  "peer_tags": {}, "pinned_peers": [], "pinned_groups": []}
 
 
 def load_config():
@@ -124,6 +125,19 @@ def load_config():
             cfg[k] = []
     if not isinstance(cfg.get("peer_notes"), dict):
         cfg["peer_notes"] = {}
+    if not isinstance(cfg.get("peer_tags"), dict):
+        cfg["peer_tags"] = {}
+    for k in ("pinned_peers", "pinned_groups"):
+        if not isinstance(cfg.get(k), list):
+            cfg[k] = []
+    # 标签规范化：{pid: [标签...]}，标签为去空格的非空字符串
+    tags = {}
+    for pid, tl in cfg["peer_tags"].items():
+        if isinstance(tl, list):
+            ts = [str(t).strip() for t in tl if str(t).strip()]
+            if ts:
+                tags[str(pid)] = ts
+    cfg["peer_tags"] = tags
     for k in ("avatar", "avatar_data", "download_dir"):
         if not isinstance(cfg.get(k), str):
             cfg[k] = ""
@@ -326,10 +340,14 @@ class Node(CollabMixin):
                 "subnets": list(self.cfg.get("subnets", [])),
                 "favorites": list(self.cfg.get("favorites", [])),
                 "peer_notes": dict(self.cfg.get("peer_notes", {})),
+                "peer_tags": dict(self.cfg.get("peer_tags", {})),
+                "pinned_peers": list(self.cfg.get("pinned_peers", [])),
+                "pinned_groups": list(self.cfg.get("pinned_groups", [])),
                 "config_path": CONFIG_PATH}
 
     def update_config(self, body):
-        """修改显示名称 / 个人备注 / 网段 / 收藏设备 / 给同伴的本地备注"""
+        """修改显示名称 / 个人备注 / 网段 / 收藏设备 / 给同伴的本地备注
+        / 联系人标签 / 置顶（联系人 / 群聊）"""
         if "name" in body and str(body["name"]).strip():
             self.name = str(body["name"]).strip()
             self.cfg["name"] = self.name
@@ -341,6 +359,34 @@ class Node(CollabMixin):
                 self.cfg[key] = [str(x).strip() for x in body[key] if str(x).strip()]
         if "peer_notes" in body and isinstance(body["peer_notes"], dict):
             self.cfg["peer_notes"] = {str(k): str(v) for k, v in body["peer_notes"].items()}
+        if "peer_tags" in body and isinstance(body["peer_tags"], dict):
+            tags = {}
+            for pid, tl in body["peer_tags"].items():
+                if isinstance(tl, list):
+                    ts = [str(t).strip() for t in tl if str(t).strip()]
+                    if ts:
+                        tags[str(pid)] = ts
+            self.cfg["peer_tags"] = tags
+        if "toggle_pin_peer" in body:
+            pid = str(body["toggle_pin_peer"])
+            pins = list(self.cfg.get("pinned_peers", []))
+            if pid in pins:
+                pins.remove(pid)
+            elif pid:
+                pins.append(pid)
+            self.cfg["pinned_peers"] = pins
+        if "toggle_pin_group" in body:
+            gid = str(body["toggle_pin_group"])
+            pins = list(self.cfg.get("pinned_groups", []))
+            if gid in pins:
+                pins.remove(gid)
+            elif gid:
+                pins.append(gid)
+            self.cfg["pinned_groups"] = pins
+        if isinstance(body.get("pinned_peers"), list):
+            self.cfg["pinned_peers"] = [str(x) for x in body["pinned_peers"] if x]
+        if isinstance(body.get("pinned_groups"), list):
+            self.cfg["pinned_groups"] = [str(x) for x in body["pinned_groups"] if x]
         if "add_subnet" in body:
             v = str(body["add_subnet"]).strip()
             if v and v not in self.cfg["subnets"]:
@@ -363,6 +409,8 @@ class Node(CollabMixin):
 
     def peers_detail(self):
         now = time.time()
+        tags_map = self.cfg.get("peer_tags", {})
+        pins = set(self.cfg.get("pinned_peers", []))
         with self.peers_lock:
             items = []
             for pid, p in self.peers.items():
@@ -375,8 +423,10 @@ class Node(CollabMixin):
                               "avatar": p.get("avatar", ""),
                               "source": p.get("source", ""),
                               "online": now - p.get("last_seen", 0) < PEER_TIMEOUT,
+                              "tags": list(tags_map.get(pid, [])),
+                              "pinned": pid in pins,
                               "color": color_of(pid)})
-            return sorted(items, key=lambda x: x["name"])
+            return sorted(items, key=lambda x: (not x["pinned"], x["name"]))
 
     def register_peer(self, info, ip):
         """LocalSend 式双向发现：收到任何设备信息都登记为同伴"""
@@ -1433,6 +1483,27 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/chat":
             q = self._query()
             self._json(node.chat_since(int(q.get("since", "0"))))
+        elif path == "/api/chat/image":
+            # 本地 Web 界面查看聊天图片（仅 127.0.0.1，局域网成员走文件通道）
+            if self.client_address[0] not in ("127.0.0.1", "::1"):
+                self.send_error(403)
+                return
+            q = self._query()
+            with node.chat_lock:
+                msg = node.chat_index.get(q.get("mid", ""))
+            p = (msg or {}).get("path") or ""
+            if (msg or {}).get("kind") != "image" or not os.path.isfile(p):
+                self.send_error(404)
+                return
+            ext = os.path.splitext(p)[1].lower()
+            ctype = {".gif": "image/gif", ".png": "image/png",
+                     ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".bmp": "image/bmp", ".webp": "image/webp"}.get(ext)
+            if not ctype:
+                self.send_error(415)
+                return
+            with open(p, "rb") as f:
+                self._binary(f.read(), ctype)
         elif path == "/api/files":
             self._json({"transfers": node.transfer_list(),
                         "download_dir": node.download_dir()})
@@ -1534,6 +1605,12 @@ class Handler(BaseHTTPRequestHandler):
                 elif kind == "file":
                     r = node.send_file(body.get("path", ""),
                                        to=body.get("to"), gid=gid or None)
+                    self._json({"ok": True, **r})
+                    return
+                elif kind == "image":
+                    r = node.send_file(body.get("path", ""),
+                                       to=body.get("to"), gid=gid or None,
+                                       image=True)
                     self._json({"ok": True, **r})
                     return
                 else:

@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LanExcel 内网协作</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --panel:#ffffff; --border:#d9dee5; --text:#243342;
+    --sub:#7a8794; --accent:#2980b9; --accent-soft:#eaf4fb;
+    --head-bg:#eef1f5; --sel:#fff3c4;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Microsoft YaHei",system-ui,sans-serif; background:var(--bg);
+       color:var(--text); font-size:13px; height:100vh; display:flex; flex-direction:column;}
+  /* ---------- 顶栏 ---------- */
+  #topbar{background:var(--panel); border-bottom:1px solid var(--border);
+          padding:8px 14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  #topbar .logo{font-weight:bold; font-size:15px; color:var(--accent);}
+  .chip{background:var(--accent-soft); border:1px solid var(--border); border-radius:12px;
+        padding:2px 10px; font-size:12px; display:inline-flex; align-items:center; gap:5px;}
+  .dot{width:9px; height:9px; border-radius:50%; display:inline-block;}
+  button{background:var(--panel); border:1px solid var(--border); border-radius:5px;
+         padding:5px 12px; cursor:pointer; font-size:12px; color:var(--text);}
+  button:hover{background:var(--accent-soft); border-color:var(--accent); color:var(--accent);}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  button.primary:hover{opacity:.9;}
+  select{border:1px solid var(--border); border-radius:5px; padding:4px 8px; font-size:12px;
+         background:#fff; color:var(--text); max-width:180px;}
+  /* ---------- 公式栏 ---------- */
+  #formulabar{background:var(--panel); border-bottom:1px solid var(--border);
+              padding:6px 14px; display:flex; gap:8px; align-items:center;}
+  #cellref{width:64px; text-align:center; background:var(--head-bg); border:1px solid var(--border);
+           border-radius:4px; padding:5px 4px; font-weight:bold;}
+  #finput{flex:1; border:1px solid var(--border); border-radius:4px; padding:5px 8px;
+          font-size:13px; font-family:Consolas,monospace;}
+  #finput:focus{outline:none; border-color:var(--accent);}
+  /* ---------- 状态条 ---------- */
+  #statusbar{background:var(--panel); border-bottom:1px solid var(--border); padding:5px 14px;
+             display:flex; gap:14px; align-items:center; flex-wrap:wrap; font-size:12px; color:var(--sub);}
+  #users{display:flex; gap:6px; flex-wrap:wrap;}
+  #regionhint b{color:var(--accent);}
+  #warncell{color:#c0392b;}
+  /* ---------- 配置条 ---------- */
+  #configbar{background:var(--panel); border-bottom:1px solid var(--border); padding:6px 14px;
+             display:flex; gap:7px; align-items:center; flex-wrap:wrap; font-size:12px;}
+  #configbar .lbl{color:var(--sub);}
+  #configbar input{border:1px solid var(--border); border-radius:4px; padding:4px 6px; font-size:12px;}
+  #configbar .sep{width:1px; height:18px; background:var(--border); margin:0 6px;}
+  #cfgsubnets{color:var(--sub);}
+  /* ---------- 网格 ---------- */
+  #gridwrap{flex:1; overflow:auto; background:var(--bg); padding:10px 14px;}
+  /* ---------- 底部工作表标签栏 ---------- */
+  #sheettabs{display:none; flex-wrap:wrap; gap:4px; padding:6px 14px;
+    background:var(--panel); border-top:1px solid var(--border);}
+  #sheettabs .stab{border:1px solid var(--border); background:var(--panel);
+    color:var(--text); border-radius:6px 6px 0 0; padding:4px 14px; cursor:pointer;
+    font-size:13px; white-space:nowrap;}
+  #sheettabs .stab:hover{background:var(--hover,#EEF3F8);}
+  #sheettabs .stab.cur{background:#0067C0; color:#fff; border-color:#0067C0; font-weight:600;}
+  table{border-collapse:collapse; background:var(--panel);}
+  th,td{border:1px solid var(--border); width:88px; min-width:88px; height:24px;
+        padding:0 6px; font-size:12px; white-space:nowrap; overflow:hidden;
+        text-overflow:ellipsis; position:relative;}
+  th{background:var(--head-bg); text-align:center; font-weight:normal; color:var(--sub);
+     position:sticky; z-index:2;}
+  th.rowh{left:0; width:44px; min-width:44px; position:sticky; z-index:3;}
+  th.myband{background:var(--sel); color:#8a6d00; font-weight:bold;}
+  th.othband{color:#fff;}
+  td{cursor:cell;}
+  td.sel{outline:2px solid var(--accent); outline-offset:-2px; background:var(--accent-soft);}
+  td.num{text-align:right;}
+  td.othercur{box-shadow:inset 0 0 0 2px var(--cur-color,#c0392b);}
+  td .tag{position:absolute; top:0; right:0; background:var(--cur-color,#c0392b); color:#fff;
+          font-size:10px; padding:0 4px; border-bottom-left-radius:4px; line-height:14px;}
+  td.mybandcell{background:#fffdf2;}
+  /* ---------- 原样渲染（以原 xlsx 为样式模板） ---------- */
+  table.styled td, table.styled th{min-width:0; width:auto; height:auto;}
+  table.styled td{border:1px solid #d7dee8; background:#fff;}
+  table.styled td.wrap{white-space:normal; word-break:break-all; overflow:hidden;}
+  #stylehint{color:#1f7a4d; font-weight:bold;}
+  /* ---------- 群聊侧栏（v3） ---------- */
+  #chatpanel{position:fixed; top:0; right:0; width:360px; height:100vh; background:var(--panel);
+             border-left:1px solid var(--border); box-shadow:-4px 0 18px rgba(0,0,0,.12);
+             display:none; flex-direction:column; z-index:50;}
+  #chatpanel.open{display:flex;}
+  #chathead{padding:10px 12px; border-bottom:1px solid var(--border); display:flex;
+            align-items:center; gap:6px; flex-wrap:wrap;}
+  #chathead b{color:var(--accent); font-size:14px;}
+  #chatmsg{flex:1; overflow:auto; padding:10px 12px; background:#fafbfc;}
+  .msg{margin-bottom:10px; display:flex; gap:8px; align-items:flex-start;}
+  .msg img{width:32px; height:32px; border-radius:50%; flex:none; background:var(--head-bg);}
+  .msg .body{flex:1; font-size:12px; line-height:1.5; word-break:break-all;}
+  .msg .who{color:var(--accent); font-weight:bold;}
+  .msg .time{color:var(--sub); font-weight:normal; margin-left:6px; font-size:11px;}
+  .msg .sys{color:var(--sub); font-style:italic;}
+  .msg a.link{color:var(--accent); cursor:pointer; text-decoration:underline;}
+  #chatfoot{border-top:1px solid var(--border); padding:8px 10px; display:flex;
+            flex-direction:column; gap:6px;}
+  #chatfoot .row{display:flex; gap:6px; align-items:center;}
+  #chatfoot input[type=text]{flex:1; min-width:0; border:1px solid var(--border);
+            border-radius:4px; padding:5px 7px; font-size:12px;}
+  #transferbox{max-height:90px; overflow:auto; font-size:11px; color:var(--sub);}
+  #chatpanel .mini{font-size:11px; padding:3px 7px;}
+  /* ---------- 空状态 ---------- */
+  #empty{margin:60px auto; text-align:center; color:var(--sub);}
+  #empty h2{color:var(--text); margin-bottom:10px;}
+  #empty p{margin:6px 0;}
+  #empty .btns{margin-top:16px; display:flex; gap:10px; justify-content:center;}
+  #toast{position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+         background:#323e4a; color:#fff; padding:8px 18px; border-radius:6px; font-size:13px;
+         display:none; z-index:99;}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <span class="logo">LanExcel</span>
+    <span class="chip"><span class="dot" id="mydot"></span><span id="myname">…</span></span>
+    <select id="roomsel" title="切换房间"><option value="">— 选择房间 —</option></select>
+    <select id="sheetsel" title="切换工作表" style="max-width:130px"><option value="">工作表</option></select>
+    <button class="primary" onclick="newRoom()">新建房间</button>
+    <button onclick="openXlsx()">打开 Excel</button>
+    <button onclick="saveXlsx(false)">保存</button>
+    <button onclick="saveXlsx(true)">另存为</button>
+    <span style="flex:1"></span>
+    <span class="chip" id="peerchip" title="已发现的内网节点">节点 0</span>
+    <span class="chip" id="roomchip">未加入房间</span>
+    <button class="primary" onclick="toggleChat()">群聊 / 文件</button>
+  </div>
+
+  <div id="formulabar">
+    <div id="cellref">-</div>
+    <input id="finput" placeholder="输入内容后回车写入当前单元格；←→↑↓ 移动，Delete 清空，Esc 取消" autocomplete="off">
+  </div>
+
+  <div id="statusbar">
+    <span id="users">在线成员：加载中…</span>
+    <span id="regionhint"></span>
+    <span id="stylehint"></span>
+    <span id="warncell"></span>
+  </div>
+
+  <div id="configbar">
+    <span class="lbl">显示名称</span><input id="cfgname" size="12">
+    <span class="lbl">个人备注</span><input id="cfgnote" size="20">
+    <button onclick="saveProfile()">保存资料</button>
+    <span class="sep"></span>
+    <span class="lbl">添加网段</span><input id="cfgsubnet" size="18" placeholder="192.168.2.0/24 或单IP">
+    <button onclick="addSubnet()">添加并扫描</button>
+    <span id="cfgsubnets"></span>
+  </div>
+
+  <div id="gridwrap">
+    <div id="empty">
+      <h2>还没有加入任何房间</h2>
+      <p>「新建房间」创建一张共享空表；「打开 Excel」把本机已有的表格变为共享房间。<br>
+      同事在自己电脑上用<b>相同的房间名</b>新建，即可自动同步到同一张表。</p>
+      <div class="btns">
+        <button class="primary" onclick="newRoom()">新建房间</button>
+        <button onclick="openXlsx()">打开 Excel</button>
+      </div>
+    </div>
+    <table id="grid" style="display:none"></table>
+  </div>
+
+  <div id="sheettabs"></div>
+
+  <div id="chatpanel">
+    <div id="chathead">
+      <b>局域网群聊</b>
+      <select id="groupsel" style="flex:1" onchange="switchGroup()"></select>
+      <button class="mini" onclick="newGroup()">建群</button>
+      <button class="mini" onclick="openInvite()">邀请</button>
+      <button class="mini" onclick="toggleChat()">×</button>
+    </div>
+    <div id="chatmsg"></div>
+    <div id="chatfoot">
+      <div id="transferbox">文件传输进度：加载中…</div>
+      <div class="row">
+        <input type="text" id="chatin" placeholder="输入消息后回车发送" autocomplete="off">
+        <button class="primary mini" onclick="sendChatText()">发送</button>
+      </div>
+      <div class="row" style="flex-wrap:wrap">
+        <button class="mini" onclick="sendSheetToGroup()">发送协作表格</button>
+        <button class="mini" onclick="sendLocalXlsx()">本地表格→协作表</button>
+        <button class="mini" onclick="sendFileToGroup()">发送文件到群</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const NUM_R = 60, NUM_C = 26;          // 网格规模（随数据自动扩大，上限 500×40）
+let me = null, room = "", since = 0;
+let cells = {};                        // "r,c" -> [v, ts, who]
+let users = [];                        // 在线成员
+let meta = {sheet:"", rows:NUM_R, cols:NUM_C, file:""};
+let sel = null;                        // {r,c}
+let editing = false;
+let maxR = NUM_R, maxC = NUM_C;
+let styleInfo = null, styleVersion = -1, sheetNames = [];
+let mergeCovered = {}, mergeSpan = {};   // 合并单元格映射
+
+function colName(c){ let s=""; while(c>0){ s=String.fromCharCode(65+(c-1)%26)+s; c=Math.floor((c-1)/26);} return s; }
+function cellKey(r,c){ return r+","+c; }
+function ref(r,c){ return colName(c)+r; }
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.style.display="block";
+                     clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none",2600); }
+function post(url, obj){ return fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(obj)}).then(r=>r.json()); }
+
+/* ---------------- 初始化 ---------------- */
+fetch("/api/state").then(r=>r.json()).then(st=>{
+  me = st.me;
+  $("myname").textContent = me.name;
+  $("mydot").style.background = me.color;
+  $("grid").style.setProperty("--cur-color", me.color);
+  refreshRooms(st.rooms.map(r=>r.name));
+  loadConfig();
+  setInterval(poll, 1000);
+  setInterval(pollChat, 1500);
+  pollChat();
+});
+
+function loadConfig(){
+  fetch("/api/config").then(r=>r.json()).then(c=>{
+    $("cfgname").value = c.name || "";
+    $("cfgnote").value = c.note || "";
+    $("cfgsubnets").textContent = "已添加网段: " + (c.subnets.length ? c.subnets.join(" / ") : "无");
+  }).catch(()=>{});
+}
+function saveProfile(){
+  post("/api/config",{name:$("cfgname").value, note:$("cfgnote").value}).then(loadConfig);
+  toast("资料已保存并广播给同伴");
+}
+function addSubnet(){
+  const v = $("cfgsubnet").value.trim(); if(!v) return;
+  post("/api/config",{add_subnet:v}).then(()=>{
+    $("cfgsubnet").value=""; loadConfig(); post("/api/scan",{});
+    toast("已添加网段 "+v+"，正在扫描");
+  });
+}
+
+function refreshRooms(list){
+  const selEl = $("roomsel");
+  const cur = room;
+  selEl.innerHTML = "<option value=''>— 选择房间 —</option>" +
+    list.map(n=>`<option value="${n}">${n}</option>`).join("");
+  if(cur && list.includes(cur)) selEl.value = cur;
+  $("roomchip").textContent = cur ? ("房间: "+cur) : "未加入房间";
+  $("empty").style.display = cur ? "none" : "block";
+  $("grid").style.display  = cur ? "table" : "none";
+}
+
+/* ---------------- 轮询同步 ---------------- */
+function poll(){
+  if(!room){ fetch("/api/state").then(r=>r.json()).then(st=>refreshRooms(st.rooms.map(r=>r.name))).catch(()=>{}); return; }
+  fetch(`/api/poll?since=${since}&room=${encodeURIComponent(room)}`)
+    .then(r=>r.json()).then(d=>{
+      // 样式模板可能稍后才从同伴同步过来，版本变化时强制下一轮全量拉取
+      if(d.style_version !== undefined && d.style_version !== styleVersion){
+        styleVersion = d.style_version; since = 0;
+      }
+      if(d.full){ cells = d.cells || {}; if(d.meta) meta = d.meta;
+                  if(d.style !== undefined) styleInfo = d.style;
+                  const rows = styleInfo ? styleInfo.rows : meta.rows;
+                  const cols = styleInfo ? styleInfo.cols : meta.cols;
+                  maxR = Math.max(NUM_R, Math.min(rows||NUM_R,500));
+                  maxC = Math.max(NUM_C, Math.min(cols||NUM_C,40));
+                  since = d.seq; buildGrid(); }
+      else if(d.edits && d.edits.length){
+        for(const e of d.edits){ since = Math.max(since, e.seq);
+          for(const [k,[v,ts,who]] of Object.entries(e.cells)) cells[k]=[v,ts,who]; }
+      }
+      if(d.users) users = d.users;
+      if(d.peers) $("peerchip").textContent = "节点 "+d.peers.length;
+      if(d.rooms) refreshRooms(d.rooms);
+      if(d.meta) meta = d.meta;
+      if(d.sheets && d.sheets.length) sheetNames = d.sheets;
+      else if(meta.sheets && meta.sheets.length) sheetNames = meta.sheets;
+      else if(styleInfo && styleInfo.sheets) sheetNames = styleInfo.sheets;
+      fillSheetSelect();
+      render();
+    }).catch(()=>{});
+}
+
+function fillSheetSelect(){
+  const s = $("sheetsel");
+  const cur = meta.sheet || (styleInfo ? styleInfo.sheet : "");
+  s.innerHTML = "<option value=''>工作表</option>" +
+    (sheetNames||[]).map(n=>`<option value="${n}">${n}</option>`).join("");
+  if(cur && (sheetNames||[]).includes(cur)) s.value = cur;
+  renderSheetTabs(cur);
+}
+function renderSheetTabs(cur){
+  const bar = $("sheettabs");
+  const names = sheetNames || [];
+  if(!names.length){ bar.style.display = "none"; bar.innerHTML = ""; return; }
+  cur = cur || meta.sheet || (styleInfo ? styleInfo.sheet : "");
+  bar.style.display = "flex";
+  bar.innerHTML = names.map(n=>
+    `<div class="stab${n===cur?" cur":""}" data-n="${n}">${n}</div>`).join("");
+  [...bar.children].forEach(el=>{
+    el.onclick = ()=>{ if(el.dataset.n !== cur) switchSheet(el.dataset.n); };
+  });
+}
+function switchSheet(name){
+  name = name || $("sheetsel").value;
+  if(!name || !room) return;
+  const base = room.split("::")[0];
+  const active = styleInfo ? styleInfo.active : "";
+  const target = (name===active) ? base : base+"::"+name;
+  if(target===room) return;
+  $("sheetsel").value = name;
+  post("/api/new",{room:target}).then(()=>{
+    room = target; since = 0; cells = {}; sel = null;
+    styleInfo = null; styleVersion = -1;
+    renderSheetTabs(name);
+    const list = [...$("roomsel").options].map(o=>o.value).filter(v=>v);
+    if(!list.includes(target)) list.push(target);
+    refreshRooms(list);
+    $("roomsel").value = room;
+    toast("已切换到工作表: "+name);
+  });
+}
+$("sheetsel").addEventListener("change", switchSheet);
+
+/* ---------------- 网格 ---------------- */
+function borderCss(spec){
+  if(!spec) return "1px solid #d7dee8";
+  const st = spec[0]||"thin", color = spec[1]||"#7F7F7F", w = spec[2]||1;
+  let kind = "solid";
+  if(st==="dotted"||st==="dashDotDot") kind="dotted";
+  else if(st.indexOf("dash")===0 || st==="slantDashDot") kind="dashed";
+  else if(st==="double") kind="double";
+  return `${w}px ${kind} ${color}`;
+}
+function applyCellStyle(td, rec){
+  rec = rec || {};
+  const f = rec.font || (styleInfo && styleInfo.base_font) || {};
+  td.style.fontFamily = f.family || "宋体";
+  td.style.fontSize = (f.size||11)+"pt";
+  td.style.fontWeight = f.bold ? "bold" : "normal";
+  td.style.fontStyle = f.italic ? "italic" : "normal";
+  const color = f.color || "#1A1A1A";
+  td.style.color = color; td.dataset.baseColor = color;
+  td.style.backgroundColor = rec.fill || "#fff";
+  const al = rec.align || {};
+  let h = al.h || "general";
+  if(h==="general") h = "left";
+  td.style.textAlign = (h==="center"||h==="right") ? h : "left";
+  td.style.verticalAlign = al.v==="center" ? "middle" : (al.v==="top" ? "top" : "bottom");
+  if(al.wrap) td.classList.add("wrap");
+  const b = rec.border || {};
+  td.style.borderLeft = borderCss(b.l);
+  td.style.borderRight = borderCss(b.r);
+  td.style.borderTop = borderCss(b.t);
+  td.style.borderBottom = borderCss(b.b);
+}
+function buildGrid(){
+  const tb = $("grid");
+  tb.innerHTML = "";
+  mergeCovered = {}; mergeSpan = {};
+  const styled = !!styleInfo;
+  tb.className = styled ? "styled" : "";
+  if(styled){
+    for(const m of (styleInfo.merged||[])){
+      const r1=m[0], c1=m[1], r2=m[2], c2=m[3];
+      mergeSpan[cellKey(r1,c1)] = [r2-r1+1, c2-c1+1];
+      for(let r=r1;r<=r2;r++) for(let c=c1;c<=c2;c++){
+        if(r!==r1||c!==c1) mergeCovered[cellKey(r,c)] = cellKey(r1,c1);
+      }
+    }
+    const cg = document.createElement("colgroup");
+    const c0 = document.createElement("col"); c0.style.width="44px"; cg.appendChild(c0);
+    for(let c=1;c<=maxC;c++){
+      const col = document.createElement("col");
+      col.style.width = ((styleInfo.col_widths||{})[colName(c)] ||
+                         styleInfo.default_col || 96)+"px";
+      cg.appendChild(col);
+    }
+    tb.appendChild(cg);
+  }
+  const uh = tb.createTHead().insertRow();
+  const corner = uh.insertCell(); corner.className="rowh"; corner.outerHTML = '<th class="rowh"></th>';
+  for(let c=1;c<=maxC;c++){ const th=document.createElement("th"); th.id="ch"+c; th.textContent=colName(c); uh.appendChild(th); }
+  const body = tb.createTBody();
+  for(let r=1;r<=maxR;r++){
+    const tr = body.insertRow();
+    if(styled) tr.style.height = ((styleInfo.row_heights||{})[String(r)] ||
+                                  styleInfo.default_row || 26)+"px";
+    const rh = tr.insertCell(); rh.outerHTML = `<th class="rowh" id="rh${r}">${r}</th>`;
+    for(let c=1;c<=maxC;c++){
+      const k = cellKey(r,c);
+      if(styled && mergeCovered[k]) continue;
+      const td = tr.insertCell(); td.id = "c"+k;
+      if(styled){
+        const span = mergeSpan[k];
+        if(span){ td.colSpan=span[1]; td.rowSpan=span[0]; }
+        applyCellStyle(td, (styleInfo.cells||{})[k]);
+      }
+      td.onclick=()=>select(r,c);
+      td.ondblclick=()=>{select(r,c); $("finput").focus();};
+    }
+  }
+  $("stylehint").textContent = styled
+    ? `已按原文件样式渲染 · ${sheetNames.length} 个工作表 · ${(styleInfo.merged||[]).length} 个合并区域 · 样式只读，协作只同步值`
+    : "";
+}
+
+function render(){
+  const selKey = sel ? (mergeCovered[cellKey(sel.r,sel.c)] || cellKey(sel.r,sel.c)) : "";
+  // 单元格值
+  const view = new Set();
+  for(let r=1;r<=maxR;r++) for(let c=1;c<=maxC;c++) view.add(cellKey(r,c));
+  for(const [k,[v,ts,who]] of Object.entries(cells)){
+    if(!view.has(k)) continue;
+    const td = $("c"+k); if(!td) continue;
+    const isNum = typeof v==="number";
+    td.textContent = String(v);
+    const wrapCls = td.classList.contains("wrap") ? "wrap " : "";
+    td.className = wrapCls + (styleInfo ? "" : (isNum?"num ":"")) +
+                   (selKey && k===selKey ? "sel " : "");
+    if(typeof v==="string" && v.startsWith("=")) td.style.color="#8e44ad";
+    else td.style.color = styleInfo ? (td.dataset.baseColor || "#1A1A1A") : "";
+    if(me && who===me.id) td.classList.add("mine") ;
+  }
+  // 他人光标
+  document.querySelectorAll("td.othercur").forEach(td=>{td.classList.remove("othercur"); const t=td.querySelector(".tag"); if(t)t.remove();});
+  for(const u of users){
+    if(!u.cell || (me && u.id===me.id)) continue;
+    const td = $("c"+(mergeCovered[u.cell] || u.cell)); if(!td) continue;
+    td.style.setProperty("--cur-color", u.color);
+    td.classList.add("othercur");
+    const tag=document.createElement("span"); tag.className="tag"; tag.textContent=u.name; td.appendChild(tag);
+  }
+  // 列头区域着色
+  document.querySelectorAll("th").forEach(th=>th.classList.remove("myband","othband"));
+  document.querySelectorAll("td.mybandcell").forEach(td=>td.classList.remove("mybandcell"));
+  const mine = users.find(u=>me && u.id===me.id);
+  if(mine){
+    for(let c=mine.region.start;c<=Math.min(mine.region.end,maxC);c++){
+      const th=$("ch"+c); if(th){th.classList.add("myband");}
+      for(let r=1;r<=maxR;r++){ const td=$("c"+cellKey(r,c)); if(td && !td.classList.contains("sel")) td.classList.add("mybandcell"); }
+    }
+    for(const u of users){
+      if(u.id===me.id) continue;
+      for(let c=u.region.start;c<=Math.min(u.region.end,maxC);c++){
+        const th=$("ch"+c); if(th){ th.classList.add("othband"); th.style.background=u.color; }
+      }
+    }
+    $("regionhint").innerHTML = `我的推荐区域: <b>${colName(mine.region.start)}–${colName(Math.min(mine.region.end,maxC))} 列</b>（按成员自动分配，降低冲突）`;
+  }
+  // 在线成员
+  $("users").innerHTML = "在线成员: " + users.map(u =>
+    `<span class="chip" title="${(u.note||'')} ${(u.local_note?'· 我的备注: '+u.local_note:'')}"><span class="dot" style="background:${u.color}"></span>${u.name}</span>`).join("");
+  // 编辑冲突提示（软提示，LWW 兜底）
+  const warn = $("warncell");
+  if(sel && me){
+    const other = users.find(u=>u.id!==me.id && u.cell===cellKey(sel.r,sel.c));
+    warn.textContent = other ? `⚠ ${other.name} 也在编辑 ${ref(sel.r,sel.c)}，后保存的会覆盖先保存的` : "";
+  }
+  if(sel) $("cellref").textContent = ref(sel.r,sel.c);
+}
+
+/* ---------------- 选择与编辑 ---------------- */
+function select(r,c){
+  if(editing) commit();
+  sel = {r,c};
+  const k = cellKey(r,c);
+  const tk = mergeCovered[k] || k;
+  document.querySelectorAll("td.sel").forEach(td=>td.classList.remove("sel"));
+  const td=$("c"+tk); if(td){ td.classList.add("sel"); td.scrollIntoView({block:"nearest",inline:"nearest"}); }
+  const cur = cells[tk] || cells[k];
+  $("finput").value = cur ? (typeof cur[0]==="number"?cur[0]:String(cur[0])) : "";
+  $("cellref").textContent = ref(r,c);
+  if(room) post("/api/presence",{room, cell:k});
+}
+function commit(move){
+  if(!sel || !editing && $("finput").value==="") { /* still allow empty write */ }
+  if(!sel) return;
+  const raw = $("finput").value;
+  let v;
+  if(raw==="") v = "";
+  else if(!isNaN(Number(raw)) && raw.trim()!=="") v = Number(raw);
+  else v = raw;
+  const k = cellKey(sel.r,sel.c);
+  cells[k] = [v, Date.now()*1e6, me.id];   // 本地乐观更新
+  post("/api/set",{room, cells:[{r:sel.r,c:sel.c,v}]}).catch(()=>{});
+  render();
+  if(move==="down") select(Math.min(sel.r+1,maxR), sel.c);
+  else if(move==="right") select(sel.r, Math.min(sel.c+1,maxC));
+  editing = false;
+}
+$("finput").addEventListener("focus", ()=>editing=true);
+$("finput").addEventListener("input", ()=>editing=true);
+$("finput").addEventListener("keydown", e=>{
+  if(e.key==="Enter"){ e.preventDefault(); commit("down"); }
+  else if(e.key==="Tab"){ e.preventDefault(); commit("right"); }
+  else if(e.key==="Escape"){ editing=false; if(sel) select(sel.r,sel.c); }
+});
+document.addEventListener("keydown", e=>{
+  if(document.activeElement===$("finput")) return;
+  if(!sel) return;
+  const d = {ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]}[e.key];
+  if(d){ e.preventDefault();
+    select(Math.max(1,Math.min(maxR,sel.r+d[0])), Math.max(1,Math.min(maxC,sel.c+d[1]))); }
+  else if(e.key==="Delete"||e.key==="Backspace"){
+    e.preventDefault(); $("finput").value=""; commit(); if(e.key==="Delete"){cells[cellKey(sel.r,sel.c)]=["",Date.now()*1e6,me.id];} }
+  else if(e.key.length===1 && !e.ctrlKey && !e.altKey){ $("finput").focus(); }
+});
+$("roomsel").addEventListener("change", ()=>{
+  room = $("roomsel").value; since = 0; cells = {}; sel = null;
+  styleInfo = null; styleVersion = -1; sheetNames = [];
+  refreshRooms([...$("roomsel").options].map(o=>o.value).filter(v=>v));
+  if(room) toast("已切换到房间: "+room);
+});
+
+/* ---------------- 房间操作 ---------------- */
+function newRoom(){
+  const name = prompt("房间名（同一内网的同事用相同名字即可互相同步）:", room || "共享表1");
+  if(!name) return;
+  post("/api/new",{room:name}).then(res=>{
+    if(!res.ok){ toast("创建失败: "+res.error); return; }
+    room = name; since = 0; cells = {};
+    styleInfo = null; styleVersion = -1; sheetNames = [];
+    refreshRooms([name]); select(1,1); toast("房间已创建: "+name);
+  });
+}
+function openXlsx(){
+  const path = prompt("输入本机 Excel 文件完整路径:", "I:\\excel\\协作表.xlsx");
+  if(!path) return;
+  post("/api/open",{path}).then(res=>{
+    if(!res.ok){ toast("打开失败: "+res.error); return; }
+    room = res.room; since = 0; cells = {};
+    styleInfo = null; styleVersion = -1; sheetNames = res.sheets || [];
+    refreshRooms([room]);
+    toast(`已共享: ${path}（房间: ${room}）· 原有样式完整保留：${res.style||""}`);
+  });
+}
+function saveXlsx(saveAs){
+  if(!room){ toast("请先加入房间"); return; }
+  const doSave = p => post("/api/save",{room, path:p}).then(res=>{
+    if(res.ok) toast("已保存到: "+res.path); else toast("保存失败: "+res.error);
+  });
+  if(saveAs || !meta.file){
+    const p = prompt("保存到路径:", meta.file || "I:\\excel\\"+room+".xlsx");
+    if(p) doSave(p);
+  } else doSave(null);
+}
+
+/* ---------------- 局域网群聊 / 文件传输（v3） ---------------- */
+let chatSeq = 0, curGid = "", chatGroups = [];
+const avatarCache = {};
+function toggleChat(){ $("chatpanel").classList.toggle("open"); if($("chatpanel").classList.contains("open")) pollChat(); }
+function needGroup(){ if(!curGid){ toast("请先新建或选择一个群聊"); return false; } return true; }
+function avatarURI(pid, data, name){
+  if(data) return "data:image/png;base64," + data;
+  if(avatarCache[pid]) return avatarCache[pid];
+  const ch = (name || "?").slice(0,1).replace(/[<>&"']/g, "");
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">'+
+              '<circle cx="16" cy="16" r="16" fill="#2980b9"/>'+
+              '<text x="16" y="21" font-size="15" fill="#fff" text-anchor="middle" font-family="sans-serif">'+ch+'</text></svg>';
+  return "data:image/svg+xml;charset=utf-8,"+encodeURIComponent(svg);
+}
+function fetchAvatar(pid){
+  if(avatarCache[pid]) return;
+  fetch("/api/avatar/peer?pid="+encodeURIComponent(pid)).then(r=>r.json())
+    .then(d=>{ if(d.data) avatarCache[pid]="data:image/png;base64,"+d.data; }).catch(()=>{});
+}
+function updateGroupSelect(){
+  const s = $("groupsel");
+  const ids = chatGroups.map(g=>g.id);
+  if(ids.length && !ids.includes(curGid)) curGid = ids[0];
+  s.innerHTML = chatGroups.map(g=>`<option value="${g.id}">${g.name} (${g.count})</option>`).join("") ||
+                "<option value=''>— 暂无群聊 —</option>";
+  if(curGid) s.value = curGid;
+}
+function switchGroup(){ curGid = $("groupsel").value; $("chatmsg").innerHTML=""; chatSeq=0; pollChat(); }
+function appendMsg(m){
+  const box = $("chatmsg");
+  const row = document.createElement("div"); row.className="msg";
+  const img = document.createElement("img");
+  img.src = avatarURI(m.from, m.avatar_data, m.from_name);
+  if(!m.avatar_data && !avatarCache[m.from]) fetchAvatar(m.from);
+  row.appendChild(img);
+  const body = document.createElement("div"); body.className="body";
+  const who = document.createElement("span"); who.className="who"; who.textContent = m.from_name || "同伴";
+  const tm = document.createElement("span"); tm.className="time";
+  tm.textContent = new Date((m.ts||Date.now()/1000)*1000).toLocaleTimeString();
+  body.appendChild(who); body.appendChild(tm); body.appendChild(document.createElement("br"));
+  if(m.kind==="system"){
+    const s=document.createElement("span"); s.className="sys"; s.textContent=m.text||""; body.appendChild(s);
+  } else {
+    const txt=document.createElement("span"); txt.textContent=m.text||""; body.appendChild(txt);
+    if(m.kind==="sheet" && m.room){
+      body.appendChild(document.createElement("br"));
+      const a=document.createElement("a"); a.className="link"; a.textContent="▶ 打开协作表格「"+m.room+"」";
+      a.onclick=()=>{ room=m.room; since=0; cells={}; refreshRooms([room]); toggleChat(); toast("已打开协作表格: "+room); };
+      body.appendChild(a);
+    }
+    if(m.kind==="file" && m.path){
+      body.appendChild(document.createElement("br"));
+      const a=document.createElement("a"); a.className="link"; a.textContent="▶ 保存位置: "+m.path;
+      body.appendChild(a);
+    }
+  }
+  row.appendChild(body); box.appendChild(row);
+  box.scrollTop = box.scrollHeight;
+}
+function renderTransfers(list){
+  const recent=(list||[]).slice(-5).reverse();
+  $("transferbox").textContent = recent.length ? "文件传输: " + recent.map(t=>
+    (t.direction==="send"?"↑":"↓")+t.name+" "+
+    (t.size?Math.round(t.sent*100/t.size):100)+"% "+t.status).join(" ｜ ") : "文件传输：暂无记录（不限制大小）";
+}
+function pollChat(){
+  fetch("/api/chat?since="+chatSeq).then(r=>r.json()).then(d=>{
+    chatSeq=d.seq;
+    chatGroups=(d.groups||[]).filter(g=>g.mine);
+    updateGroupSelect();
+    (d.messages||[]).forEach(m=>{ if(m.gid===curGid) appendMsg(m); });
+    renderTransfers(d.transfers);
+  }).catch(()=>{});
+}
+$("chatin").addEventListener("keydown", e=>{ if(e.key==="Enter") sendChatText(); });
+function sendChatText(){
+  if(!needGroup()) return;
+  const t=$("chatin").value.trim(); if(!t) return;
+  post("/api/chat/send",{gid:curGid,kind:"text",text:t}); $("chatin").value="";
+}
+function newGroup(){
+  const name=prompt("群聊名称:","项目协作群"); if(!name) return;
+  post("/api/group/create",{name,members:[]}).then(d=>{
+    if(!d.ok){ toast("建群失败: "+d.error); return; }
+    curGid=d.group.id; chatSeq=0; $("chatmsg").innerHTML=""; pollChat();
+    toast("已创建群聊，点「邀请」添加成员"); openInvite();
+  });
+}
+function openInvite(){
+  if(!needGroup()) return;
+  fetch("/api/peers").then(r=>r.json()).then(d=>{
+    const ps=(d.peers||[]).filter(p=>p.online);
+    if(!ps.length){ toast("当前没有在线成员，稍后可再邀请"); return; }
+    const list=ps.map((p,i)=>(i+1)+". "+p.name+" ("+p.ip+")").join("\n");
+    const n=prompt("输入要邀请的序号（多个用逗号分隔）:\n"+list,"1");
+    if(!n) return;
+    const ids=n.split(/[,，\s]+/).map(x=>parseInt(x,10)).filter(i=>i>=1&&i<=ps.length).map(i=>ps[i-1].id);
+    if(ids.length) post("/api/group/invite",{gid:curGid,members:ids}).then(()=>toast("已邀请 "+ids.length+" 位成员"));
+  });
+}
+function sendSheetToGroup(){
+  if(!needGroup()||!room){ toast("请先加入一个协作表格房间"); return; }
+  post("/api/chat/send",{gid:curGid,kind:"sheet",room}).then(()=>toast("协作表格已发到群里"));
+}
+function sendLocalXlsx(){
+  if(!needGroup()) return;
+  const p=prompt("输入本地 Excel 完整路径（将转为群内协作表格）:","I:\\excel\\协作表.xlsx");
+  if(!p) return;
+  post("/api/chat/send",{gid:curGid,kind:"local-xlsx",path:p}).then(d=>{
+    if(!d.ok){ toast("发送失败: "+d.error); return; }
+    toast("已转为协作表格: "+d.room+"（"+d.cells+" 格）");
+  });
+}
+function sendFileToGroup(){
+  if(!needGroup()) return;
+  const p=prompt("输入要发送的文件完整路径（不限制大小）:","");
+  if(!p) return;
+  post("/api/chat/send",{gid:curGid,kind:"file",path:p}).then(d=>{
+    if(!d.ok){ toast("发送失败: "+d.error); return; }
+    toast("已向 "+d.targets.length+" 位在线群成员发送文件");
+  });
+}
+</script>
+</body>
+</html>

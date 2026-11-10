@@ -200,6 +200,10 @@ class Room:
         self.style_version = 0          # 样式变更计数，UI 据此重绘
         self.edited = set()             # {(r, c)} 1-based，仅这些格需要写回
         self.styled = False
+        # ---- v5 群内表格隔离：绑定群后只有群成员可见可编辑 ----
+        self.group_id = None            # 所属群；None = 公开房间（原有协作方式）
+        self.group_members = set()      # 成员快照，群资料未到时也能判定
+        self.owner_id = None            # 共享者
 
     def digest(self):
         with self.lock:
@@ -217,7 +221,8 @@ class Room:
                 "sheets": list(self.sheets),
                 "rows": self.rows, "cols": self.cols,
                 "count": count, "hash": h,
-                "tmpl": self.template_hash, "styled": self.styled}
+                "tmpl": self.template_hash, "styled": self.styled,
+                "group": self.group_id or ""}
 
     def snapshot(self, with_style=False):
         with self.lock:
@@ -228,7 +233,8 @@ class Room:
                              for (r, c), (v, ts, who) in self.cells.items()},
                    "tmpl": self.template_hash,
                    "style_version": self.style_version,
-                   "styled": self.styled}
+                   "styled": self.styled,
+                   "group": self.group_id or ""}
             if with_style:
                 out["style"] = self.style
             return out
@@ -407,9 +413,17 @@ class Node(CollabMixin):
                 return r
             return None
 
-    def apply_edit(self, room_name, cells, seen=None, local=False):
+    def apply_edit(self, room_name, cells, seen=None, local=False, from_peer=None):
         room = self.get_room(room_name)
         if room is None:
+            if local:
+                raise ValueError("协作表格不存在或你没有访问权限: " + str(room_name))
+            return
+        # 群内房间：非成员一律拒绝写入（含本机越权调用）
+        if local:
+            if not self.room_visible_here(room):
+                raise ValueError("该协作表格仅群成员可编辑，你不在该群聊中")
+        elif from_peer and not self.room_visible_to(room, from_peer):
             return
         changed = {}
         with room.lock:
@@ -449,6 +463,8 @@ class Node(CollabMixin):
                 room.cols = max(room.cols, meta.get("cols", 0))
             if meta.get("sheets"):
                 room.sheets = list(meta["sheets"])
+            if meta.get("group"):
+                room.group_id = meta["group"]
             if meta.get("tmpl"):
                 room.template_hash = meta["tmpl"]
             if meta.get("style"):
@@ -475,15 +491,25 @@ class Node(CollabMixin):
                 room.edit_log.append({"seq": room.seq, "cells": changed})
 
     # ---------------------------------------------------------- TCP 消息
+    def _rooms_msg_for(self, pid):
+        """按收件人裁剪房间清单：群内房间只发给群成员"""
+        with self.rooms_lock:
+            rooms = [r.rooms_map() for r in self.rooms.values()
+                     if self.room_visible_to(r, pid)]
+        return {"t": "rooms", "rooms": rooms,
+                "name": self.name, "id": self.id, "http": self.http_port}
+
     def _rooms_msg(self):
-        """房间清单广播：带上本机 HTTP 端口，方便同伴拉取样式模板"""
+        """本机全量房间清单（仅用于本地展示）"""
         with self.rooms_lock:
             rooms = [r.rooms_map() for r in self.rooms.values()]
         return {"t": "rooms", "rooms": rooms,
                 "name": self.name, "id": self.id, "http": self.http_port}
 
     def broadcast_rooms(self):
-        self.broadcast(self._rooms_msg())
+        for conn in list(self.conns):
+            if conn.peer_id:
+                conn.send(self._rooms_msg_for(conn.peer_id))
 
     def broadcast(self, obj, exclude_ids=()):
         for conn in list(self.conns):
@@ -492,8 +518,11 @@ class Node(CollabMixin):
 
     def forward(self, room, cells, seen):
         seen = set(seen) | {self.id}
+        r = self.get_room(room)
         for conn in list(self.conns):
             if conn.peer_id and conn.peer_id not in seen:
+                if r is not None and not self.room_visible_to(r, conn.peer_id):
+                    continue          # 群内房间不转发给非成员
                 conn.send({"t": "edit", "room": room, "cells": cells,
                            "seen": sorted(seen)})
 
@@ -505,14 +534,15 @@ class Node(CollabMixin):
                 if p:
                     p["last_seen"] = time.time()
         t = msg.get("t")
-        if t in ("group_update", "group_sync", "chat", "avatar"):
+        if t in ("group_update", "group_sync", "chat", "avatar", "chat_recall"):
             self.handle_collab_msg(conn, msg)
             return
         if t == "hello":
-            self.on_peer_hello(conn, msg)     # 交换头像 + 补发群聊历史
+            # 先认人再握手：补发群聊历史与房间清单都要按对方身份裁剪
             conn.peer_id = msg.get("id")
             conn.peer_name = msg.get("name", "?")
-            conn.send(self._rooms_msg())
+            self.on_peer_hello(conn, msg)     # 交换头像 + 补发群聊历史
+            conn.send(self._rooms_msg_for(conn.peer_id))
         elif t == "rooms":
             peer_ip = conn.addr[0] if getattr(conn, "addr", None) else ""
             http_port = msg.get("http")
@@ -520,11 +550,13 @@ class Node(CollabMixin):
                 with self.peers_lock:
                     p0 = self.peers.get(conn.peer_id)
                     http_port = (p0 or {}).get("http")
-            with self.peers_lock:
-                p = self.peers.get(conn.peer_id)
-                if p:
-                    p["rooms"] = {r["name"] for r in msg.get("rooms", [])}
             for rm in msg.get("rooms", []):
+                gid = rm.get("group") or ""
+                if gid:
+                    with self.groups_lock:
+                        g = self.groups.get(gid)
+                    if not (g and self.id in g["members"] and not g["dissolved"]):
+                        continue      # 非群成员：不加入、不拉数据、不可见
                 mine = self.get_room(rm["name"])
                 if mine is not None:
                     cnt, h = mine.digest()
@@ -537,14 +569,42 @@ class Node(CollabMixin):
                     self._ensure_template(rm["name"], rm["tmpl"], peer_ip,
                                           http_port, rm.get("sheet"),
                                           rm.get("sheets"))
+            with self.peers_lock:
+                p = self.peers.get(conn.peer_id)
+                if p:
+                    p["rooms"] = {r["name"] for r in msg.get("rooms", [])
+                                  if not r.get("group")
+                                  or self.room_visible_to(
+                                      self.get_room(r["name"]), self.id)}
         elif t == "state_req":
-            room = self.get_room(msg["room"])
-            if room:
-                snap = room.snapshot(with_style=False)
-                snap["t"] = "state"
-                snap["http"] = self.http_port
-                conn.send(snap)
+            room = self.get_room(msg.get("room", ""))
+            if room is None:
+                return
+            if not self.room_visible_to(room, conn.peer_id):
+                conn.send({"t": "state_denied", "room": room.name})
+                return
+            snap = room.snapshot(with_style=False)
+            snap["t"] = "state"
+            snap["http"] = self.http_port
+            conn.send(snap)
+        elif t == "state_denied":
+            # 对方拒绝：本地若有该房间的残留，直接丢弃，避免越权缓存
+            name = msg.get("room", "")
+            room = self.get_room(name)
+            if room is not None and not self.room_visible_here(room):
+                with self.rooms_lock:
+                    self.rooms.pop(name, None)
         elif t == "state":
+            name = msg.get("name", "")
+            exist = self.get_room(name)
+            if exist is not None and not self.room_visible_to(exist, conn.peer_id):
+                return                    # 拒绝非成员推来的数据
+            gid = msg.get("group") or ""
+            if gid and not exist:
+                with self.groups_lock:
+                    g = self.groups.get(gid)
+                if not (g and self.id in g["members"]):
+                    return
             self.merge_room(msg, msg.get("cells", {}))
             if msg.get("tmpl"):
                 peer_ip = conn.addr[0] if getattr(conn, "addr", None) else ""
@@ -558,7 +618,7 @@ class Node(CollabMixin):
                                       msg.get("sheets"))
         elif t == "edit":
             self.apply_edit(msg["room"], msg.get("cells", {}),
-                            seen=msg.get("seen", []))
+                            seen=msg.get("seen", []), from_peer=conn.peer_id)
         elif t == "presence":
             pid = msg.get("id")
             with self.presence_lock:
@@ -895,8 +955,9 @@ class Node(CollabMixin):
                         sheet_name, sheets):
         tmp = None
         try:
-            url = "http://%s:%s/api/room/template?room=%s&hash=%s" % (
-                peer_ip, int(http_port), quote(room_name), tmpl_hash)
+            url = "http://%s:%s/api/room/template?room=%s&hash=%s&peer=%s" % (
+                peer_ip, int(http_port), quote(room_name), tmpl_hash,
+                quote(self.id))
             # 强制直连，避免系统代理把内网请求转走
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(url, timeout=10) as resp:
@@ -956,15 +1017,23 @@ class Node(CollabMixin):
                 room.source_path = room.file_path
         return style
 
-    def open_xlsx(self, path, room_name=None):
+    def open_xlsx(self, path, room_name=None, gid=None):
         """打开 Excel：原文件复制为只读样式模板，每个工作表各建一个协作房间。
 
         房间之间只同步「值」；样式、合并、公式、其它工作表、页面设置始终以
         模板为基底，任何一次协作编辑都不会改写它们。
+        gid 非空时把整套房间绑定到该群聊：仅群成员可见可编辑。
         """
         path = os.path.abspath(path)
         if not os.path.isfile(path):
             raise ValueError("文件不存在: " + path)
+        g = None
+        if gid:
+            g = self._need_group(gid)
+            if g["dissolved"]:
+                raise ValueError("群聊已解散，无法共享表格")
+            if self.id not in g["members"]:
+                raise ValueError("你不在该群聊中，不能共享表格")
         with open(path, "rb") as f:
             raw = f.read()
         tmpl_hash = hashlib.md5(raw).hexdigest()[:16]
@@ -1011,6 +1080,10 @@ class Node(CollabMixin):
                 room.dirty = False
                 room.seq += 1
                 room.edit_log.append({"seq": room.seq, "cells": cells})
+                if g is not None:
+                    room.group_id = gid
+                    room.group_members = set(g["members"])
+                    room.owner_id = self.id
             if sn == active_name:
                 primary = {"room": rn, "cells": cells, "sheet": sn,
                            "rows": room.rows, "cols": room.cols}
@@ -1028,6 +1101,14 @@ class Node(CollabMixin):
         room = self.get_room(room_name)
         if room is None:
             raise ValueError("房间不存在: " + room_name)
+        # 群内表格：非成员不能保存（解散后成员仍可把手上数据存到本地）
+        if room.group_id:
+            with self.groups_lock:
+                g = self.groups.get(room.group_id)
+            allowed = bool(g and self.id in g["members"]) or \
+                self.id in (room.group_members or set())
+            if not allowed:
+                raise ValueError("该协作表格仅群成员可操作")
         with room.lock:
             out = os.path.abspath(path) if path else (room.file_path or room.source_path)
             tpl = room.template_path
@@ -1109,9 +1190,15 @@ class Node(CollabMixin):
                            "end": i * REGION_WIDTH + REGION_WIDTH}
         return users
 
+    def _visible_room_names(self):
+        with self.rooms_lock:
+            return sorted(n for n, r in self.rooms.items()
+                          if self.room_visible_here(r))
+
     def public_state(self):
         with self.rooms_lock:
-            rooms = [r.snapshot() for r in self.rooms.values()]
+            rooms = [r.snapshot() for r in self.rooms.values()
+                     if self.room_visible_here(r)]
         return {"me": {"id": self.id, "name": self.name, "note": self.note,
                        "color": self.color, "avatar": self.avatar,
                        "avatar_data": avatar_b64(self.avatar, self.avatar_data)},
@@ -1129,10 +1216,12 @@ class Node(CollabMixin):
 
     def poll(self, since_seq, room_name):
         room = self.get_room(room_name)
+        if room is not None and not self.room_visible_here(room):
+            room = None                      # 无权限：当作不存在，不泄露任何数据
         if room is None:
             return {"seq": 0, "edits": [], "full": True, "cells": {},
                     "users": [], "peers": self.peers_detail(),
-                    "rooms": sorted(self.rooms.keys())}
+                    "rooms": self._visible_room_names()}
         with room.lock:
             edits = [e for e in room.edit_log if e["seq"] > since_seq]
             if since_seq == 0 or (room.edit_log and since_seq > 0 and
@@ -1143,7 +1232,7 @@ class Node(CollabMixin):
             out = {"seq": room.seq, "edits": edits, "full": full,
                    "users": self.active_users(room.name),
                    "peers": self.peers_detail(),
-                   "rooms": sorted(self.rooms.keys()),
+                   "rooms": self._visible_room_names(),
                    "dirty": room.dirty,
                    "style_version": room.style_version,
                    "styled": bool(room.style),
@@ -1305,6 +1394,10 @@ class Handler(BaseHTTPRequestHandler):
             room = node.get_room(q.get("room", ""))
             src = None
             if room is not None:
+                # 群内表格的模板同样只给群成员下载
+                if not node.room_visible_to(room, q.get("peer", "")):
+                    self.send_error(403)
+                    return
                 with room.lock:
                     src = room.template_path or room.file_path
                     expected = room.template_hash
@@ -1378,7 +1471,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "cell": body.get("cell")})
                 self._json({"ok": True})
             elif path == "/api/open":
-                self._json({"ok": True, **node.open_xlsx(body["path"], body.get("room"))})
+                self._json({"ok": True, **node.open_xlsx(
+                    body["path"], body.get("room"), gid=body.get("gid") or None)})
             elif path == "/api/save":
                 self._json({"ok": True, "path": node.save_xlsx(body.get("room"), body.get("path"))})
             elif path == "/api/new":
@@ -1395,11 +1489,41 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/group/invite":
                 self._json({"ok": True, "group": node.invite_members(
                     body.get("gid", ""), body.get("members", []))})
+            elif path == "/api/group/kick":
+                self._json({"ok": True, "group": node.kick_member(
+                    body.get("gid", ""), body.get("pid", ""))})
+            elif path == "/api/group/admin":
+                self._json({"ok": True, "group": node.set_admin(
+                    body.get("gid", ""), body.get("pid", ""),
+                    bool(body.get("on", True)))})
+            elif path == "/api/group/joinmode":
+                self._json({"ok": True, "group": node.set_join_mode(
+                    body.get("gid", ""), body.get("mode", ""))})
+            elif path == "/api/group/dissolve":
+                self._json({"ok": True, "group": node.dissolve_group(
+                    body.get("gid", ""))})
+            elif path == "/api/group/leave":
+                self._json({"ok": True, "group": node.leave_group(
+                    body.get("gid", ""))})
+            elif path == "/api/group/apply":
+                self._json({"ok": True, "group": node.request_join(
+                    body.get("gid", ""))})
+            elif path == "/api/group/approve":
+                self._json({"ok": True, "group": node.approve_join(
+                    body.get("gid", ""), body.get("pid", ""),
+                    bool(body.get("ok", True)))})
+            elif path == "/api/chat/atall":
+                node.at_all(body.get("gid", ""), body.get("text", ""))
+                self._json({"ok": True})
+            elif path == "/api/chat/recall":
+                self._json(node.recall_message(body.get("mid", "")))
             elif path == "/api/chat/send":
                 kind = body.get("kind", "text")
                 gid = body.get("gid", "")
                 if kind == "text":
                     node.send_text(gid, body.get("text", ""))
+                elif kind == "atall":
+                    node.at_all(gid, body.get("text", ""))
                 elif kind == "sheet":
                     node.send_sheet(gid, body.get("room", ""))
                 elif kind == "local-xlsx":

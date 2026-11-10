@@ -101,6 +101,20 @@
             border-radius:4px; padding:5px 7px; font-size:12px;}
   #transferbox{max-height:90px; overflow:auto; font-size:11px; color:var(--sub);}
   #chatpanel .mini{font-size:11px; padding:3px 7px;}
+  /* ---------- 群设置 / 撤回（v5） ---------- */
+  #gset{border-bottom:1px solid var(--border); background:#fff; padding:10px 12px;
+        max-height:48vh; overflow:auto; font-size:12px;}
+  #gset h4{margin:0 0 6px; font-size:12px; color:var(--accent);}
+  #gset .grow{display:flex; align-items:center; gap:6px; padding:2px 0;}
+  #gset .grow span{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                   white-space:nowrap;}
+  #gset button{padding:1px 6px; font-size:11px;}
+  #gset .tag{color:#8E562E; font-size:11px;}
+  #gset .hint{color:#8a8a8a; font-size:11px; margin:4px 0 6px;}
+  .recalled{color:#9a9a9a; font-style:italic;}
+  .atall{color:#c42b1c; font-weight:600;}
+  .msg .tools{font-size:11px; color:#a0a0a0; margin-left:8px; cursor:pointer;}
+  .msg .tools:hover{color:#c42b1c; text-decoration:underline;}
   /* ---------- 空状态 ---------- */
   #empty{margin:60px auto; text-align:center; color:var(--sub);}
   #empty h2{color:var(--text); margin-bottom:10px;}
@@ -170,14 +184,17 @@
       <select id="groupsel" style="flex:1" onchange="switchGroup()"></select>
       <button class="mini" onclick="newGroup()">建群</button>
       <button class="mini" onclick="openInvite()">邀请</button>
+      <button class="mini" onclick="openGroupSettings()">群设置</button>
       <button class="mini" onclick="toggleChat()">×</button>
     </div>
+    <div id="gset" style="display:none"></div>
     <div id="chatmsg"></div>
     <div id="chatfoot">
       <div id="transferbox">文件传输进度：加载中…</div>
       <div class="row">
         <input type="text" id="chatin" placeholder="输入消息后回车发送" autocomplete="off">
         <button class="primary mini" onclick="sendChatText()">发送</button>
+        <button class="mini" onclick="sendAtAll()" title="仅群主/管理员可用">@所有人</button>
       </div>
       <div class="row" style="flex-wrap:wrap">
         <button class="mini" onclick="sendSheetToGroup()">发送协作表格</button>
@@ -552,9 +569,27 @@ function saveXlsx(saveAs){
 
 /* ---------------- 局域网群聊 / 文件传输（v3） ---------------- */
 let chatSeq = 0, curGid = "", chatGroups = [];
+let msgSeen = new Set(), needRebuild = false;
 const avatarCache = {};
 function toggleChat(){ $("chatpanel").classList.toggle("open"); if($("chatpanel").classList.contains("open")) pollChat(); }
 function needGroup(){ if(!curGid){ toast("请先新建或选择一个群聊"); return false; } return true; }
+function curGroup(){ return chatGroups.find(g=>g.id===curGid) || null; }
+function canRecall(m){
+  if(!m || m.kind==="system" || m.recalled) return false;
+  const meId = (typeof me !== "undefined" && me && me.id) ? me.id : "";
+  if(m.from && m.from === meId) return true;
+  const g = chatGroups.find(x=>x.id===m.gid);
+  return !!(g && g.is_admin && !g.dissolved);
+}
+function rebuildChat(){
+  $("chatmsg").innerHTML = ""; msgSeen.clear(); needRebuild = false;
+  fetch("/api/chat?since=0").then(r=>r.json()).then(d=>{
+    chatSeq = d.seq;
+    chatGroups = (d.groups||[]).filter(g=>g.mine);
+    updateGroupSelect();
+    (d.messages||[]).forEach(m=>appendMsg(m));
+  }).catch(()=>{});
+}
 function avatarURI(pid, data, name){
   if(data) return "data:image/png;base64," + data;
   if(avatarCache[pid]) return avatarCache[pid];
@@ -573,12 +608,22 @@ function updateGroupSelect(){
   const s = $("groupsel");
   const ids = chatGroups.map(g=>g.id);
   if(ids.length && !ids.includes(curGid)) curGid = ids[0];
-  s.innerHTML = chatGroups.map(g=>`<option value="${g.id}">${g.name} (${g.count})</option>`).join("") ||
-                "<option value=''>— 暂无群聊 —</option>";
+  s.innerHTML = chatGroups.map(g=>{
+    let mark = "";
+    if(g.dissolved) mark = " ·已解散";
+    else if(g.is_owner) mark = " ·群主";
+    else if(g.is_admin) mark = " ·管理";
+    if(g.can_manage && g.pending_count) mark += " ·待审"+g.pending_count;
+    return `<option value="${g.id}">${g.name} (${g.count})${mark}</option>`;
+  }).join("") || "<option value=''>— 暂无群聊 —</option>";
   if(curGid) s.value = curGid;
 }
-function switchGroup(){ curGid = $("groupsel").value; $("chatmsg").innerHTML=""; chatSeq=0; pollChat(); }
+function switchGroup(){ curGid = $("groupsel").value; $("chatmsg").innerHTML=""; msgSeen.clear(); chatSeq=0; pollChat(); }
 function appendMsg(m){
+  if(m.gid !== curGid) return;
+  const mid = m.id || "";
+  if(mid && msgSeen.has(mid)){ needRebuild = true; return; }   // 老消息被撤回 → 整体重绘
+  if(mid) msgSeen.add(mid);
   const box = $("chatmsg");
   const row = document.createElement("div"); row.className="msg";
   const img = document.createElement("img");
@@ -589,14 +634,33 @@ function appendMsg(m){
   const who = document.createElement("span"); who.className="who"; who.textContent = m.from_name || "同伴";
   const tm = document.createElement("span"); tm.className="time";
   tm.textContent = new Date((m.ts||Date.now()/1000)*1000).toLocaleTimeString();
-  body.appendChild(who); body.appendChild(tm); body.appendChild(document.createElement("br"));
-  if(m.kind==="system"){
+  body.appendChild(who); body.appendChild(tm);
+  if(canRecall(m)){
+    const tool = document.createElement("span"); tool.className="tools";
+    tool.textContent = m.kind==="file" ? "撤回文件" : "撤回";
+    tool.onclick = ()=>recallMsg(m);
+    body.appendChild(tool);
+  }
+  body.appendChild(document.createElement("br"));
+  if(m.recalled){
+    const s=document.createElement("span"); s.className="recalled";
+    const by = m.recalled_by_name || m.from_name || "同伴";
+    s.textContent = m.kind==="file"
+      ? "[已撤回] "+by+" 撤回了一个文件（"+(m.file||"")+"）"
+      : "[已撤回] "+by+" 撤回了一条消息";
+    body.appendChild(s);
+  } else if(m.kind==="system"){
     const s=document.createElement("span"); s.className="sys"; s.textContent=m.text||""; body.appendChild(s);
   } else {
+    if(m.at_all){
+      const a=document.createElement("span"); a.className="atall"; a.textContent="@所有人 ";
+      body.appendChild(a);
+    }
     const txt=document.createElement("span"); txt.textContent=m.text||""; body.appendChild(txt);
     if(m.kind==="sheet" && m.room){
       body.appendChild(document.createElement("br"));
-      const a=document.createElement("a"); a.className="link"; a.textContent="▶ 打开协作表格「"+m.room+"」";
+      const a=document.createElement("a"); a.className="link";
+      a.textContent="▶ 打开协作表格「"+m.room+"」（仅群成员可见）";
       a.onclick=()=>{ room=m.room; since=0; cells={}; refreshRooms([room]); toggleChat(); toast("已打开协作表格: "+room); };
       body.appendChild(a);
     }
@@ -609,6 +673,26 @@ function appendMsg(m){
   row.appendChild(body); box.appendChild(row);
   box.scrollTop = box.scrollHeight;
 }
+function recallMsg(m){
+  const tip = m.kind==="file"
+    ? "撤回这个文件？各成员下载目录中的副本会一并删除（已另存到别处的副本无法收回）。"
+    : "撤回这条消息？撤回不限时间。";
+  if(!confirm(tip)) return;
+  post("/api/chat/recall",{mid:m.id}).then(d=>{
+    if(!d.ok){ toast("撤回失败: "+(d.error||"未知错误")); return; }
+    rebuildChat();
+  });
+}
+function sendAtAll(){
+  if(!needGroup()) return;
+  const g = curGroup();
+  if(!g || !g.is_admin){ toast("只有群主或管理员可以 @所有人"); return; }
+  const t = $("chatin").value.trim() || "请注意查看群消息";
+  post("/api/chat/atall",{gid:curGid,text:t}).then(d=>{
+    if(!d.ok){ toast("发送失败: "+(d.error||"")); return; }
+    $("chatin").value="";
+  });
+}
 function renderTransfers(list){
   const recent=(list||[]).slice(-5).reverse();
   $("transferbox").textContent = recent.length ? "文件传输: " + recent.map(t=>
@@ -618,11 +702,129 @@ function renderTransfers(list){
 function pollChat(){
   fetch("/api/chat?since="+chatSeq).then(r=>r.json()).then(d=>{
     chatSeq=d.seq;
+    const sig = JSON.stringify((chatGroups||[]).map(g=>[g.id,g.rev,g.pending_count,g.join_mode,g.dissolved,g.is_admin]));
     chatGroups=(d.groups||[]).filter(g=>g.mine);
     updateGroupSelect();
-    (d.messages||[]).forEach(m=>{ if(m.gid===curGid) appendMsg(m); });
+    (d.messages||[]).forEach(m=>appendMsg(m));
+    if(needRebuild) rebuildChat();
     renderTransfers(d.transfers);
+    const sig2 = JSON.stringify(chatGroups.map(g=>[g.id,g.rev,g.pending_count,g.join_mode,g.dissolved,g.is_admin]));
+    if(sig !== sig2 && $("gset").style.display === "block") renderGroupSettings();
   }).catch(()=>{});
+}
+/* ---------------- 群设置（v5） ---------------- */
+function openGroupSettings(){
+  if(!needGroup()) return;
+  const box = $("gset");
+  if(box.style.display === "block"){ box.style.display="none"; return; }
+  box.style.display = "block";
+  renderGroupSettings();
+}
+function renderGroupSettings(){
+  const box = $("gset"); const g = curGroup();
+  box.innerHTML = "";
+  if(!g){ box.textContent = "群资料同步中…"; return; }
+  const h4 = document.createElement("h4");
+  h4.textContent = g.name+" · "+g.count+" 人 · 我是"+
+                   (g.is_owner?"群主":(g.is_admin?"管理员":"成员"));
+  box.appendChild(h4);
+  if(g.dissolved){
+    const p=document.createElement("div"); p.className="hint";
+    p.textContent="该群已解散：只能查看历史消息，群内协作表格已失效。";
+    box.appendChild(p); return;
+  }
+  if(g.can_manage){
+    const modeRow=document.createElement("label"); modeRow.className="grow";
+    const cb=document.createElement("input"); cb.type="checkbox";
+    cb.checked = (g.join_mode==="approval");
+    cb.onchange=()=>setJoinMode(cb.checked);
+    modeRow.appendChild(cb);
+    modeRow.appendChild(document.createTextNode("进群需要管理员审核"));
+    box.appendChild(modeRow);
+  }
+  if(g.can_manage && (g.pending||[]).length){
+    const t=document.createElement("h4"); t.textContent="待审核申请（"+(g.pending||[]).length+"）";
+    t.style.marginTop="8px"; box.appendChild(t);
+    (g.pending||[]).forEach(p=>{
+      const r=document.createElement("div"); r.className="grow";
+      const s=document.createElement("span"); s.textContent=p.name||String(p.id).slice(0,8);
+      r.appendChild(s);
+      const okB=document.createElement("button"); okB.textContent="同意";
+      okB.onclick=()=>approveJoin(p.id,true);
+      const noB=document.createElement("button"); noB.textContent="拒绝";
+      noB.onclick=()=>approveJoin(p.id,false);
+      r.appendChild(okB); r.appendChild(noB); box.appendChild(r);
+    });
+  }
+  const mh=document.createElement("h4"); mh.textContent="群成员";
+  mh.style.marginTop="8px"; box.appendChild(mh);
+  const meId = (typeof me !== "undefined" && me) ? me.id : "";
+  const admins = g.admins || [];
+  (g.members||[]).forEach(pid=>{
+    const r=document.createElement("div"); r.className="grow";
+    const s=document.createElement("span");
+    let nm = String(pid).slice(0,8);
+    if(meId && pid===meId) nm = (me.name||"我")+"（我）";
+    s.textContent = nm;
+    r.appendChild(s);
+    const tag=document.createElement("span"); tag.className="tag";
+    tag.textContent = pid===g.owner ? "群主" : (admins.includes(pid) ? "管理员" : "");
+    r.appendChild(tag);
+    if(g.is_owner && pid!==g.owner){
+      const b=document.createElement("button");
+      const isAdm = admins.includes(pid);
+      b.textContent = isAdm ? "取消管理" : "设为管理";
+      b.onclick=()=>setAdmin(pid,!isAdm);
+      r.appendChild(b);
+    }
+    const kickable = g.can_manage && pid!==g.owner && pid!==meId &&
+                     (!admins.includes(pid) || g.is_owner);
+    if(kickable){
+      const k=document.createElement("button"); k.textContent="移出";
+      k.onclick=()=>kickMember(pid);
+      r.appendChild(k);
+    }
+    box.appendChild(r);
+  });
+  const foot=document.createElement("div"); foot.className="grow"; foot.style.marginTop="8px";
+  if(g.is_owner){
+    const d=document.createElement("button"); d.textContent="解散群聊";
+    d.onclick=dissolveGroup; foot.appendChild(d);
+  } else {
+    const l=document.createElement("button"); l.textContent="退出群聊";
+    l.onclick=leaveGroup; foot.appendChild(l);
+  }
+  box.appendChild(foot);
+}
+function afterGroupOp(d){
+  if(!d || !d.ok){ toast("操作失败: "+((d&&d.error)||"未知错误")); return; }
+  pollChat();
+  setTimeout(()=>{ if($("gset").style.display==="block") renderGroupSettings(); }, 350);
+}
+function setJoinMode(approval){
+  post("/api/group/joinmode",{gid:curGid,mode:approval?"approval":"free"}).then(afterGroupOp);
+}
+function setAdmin(pid,on){
+  post("/api/group/admin",{gid:curGid,pid,on}).then(afterGroupOp);
+}
+function kickMember(pid){
+  if(!confirm("确定把该成员移出群聊？移出后他立即看不到群内消息和协作表格。")) return;
+  post("/api/group/kick",{gid:curGid,pid}).then(afterGroupOp);
+}
+function approveJoin(pid,ok){
+  post("/api/group/approve",{gid:curGid,pid,ok}).then(afterGroupOp);
+}
+function dissolveGroup(){
+  if(!confirm("确定解散该群聊？\n所有成员将看不到群内消息，群内协作表格立即失效，且不可撤销。")) return;
+  post("/api/group/dissolve",{gid:curGid}).then(afterGroupOp);
+}
+function leaveGroup(){
+  if(!confirm("确定退出该群聊？")) return;
+  post("/api/group/leave",{gid:curGid}).then(d=>{
+    if(!d.ok){ toast("退出失败: "+(d.error||"")); return; }
+    curGid=""; chatSeq=0; $("chatmsg").innerHTML=""; msgSeen.clear(); pollChat();
+    $("gset").style.display="none";
+  });
 }
 $("chatin").addEventListener("keydown", e=>{ if(e.key==="Enter") sendChatText(); });
 function sendChatText(){

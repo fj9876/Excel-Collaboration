@@ -86,6 +86,8 @@ class LanExcelApp:
         self.current_gid = ""
         self.group_ids = []
         self.group_data = []
+        self._rendered_mids = set()
+        self._need_rebuild = False
 
         root.title("LanExcel · 内网去中心化 Excel 协作 v3")
         root.geometry("1280x800")
@@ -228,7 +230,10 @@ class LanExcelApp:
         self.group_list.bind("<<ListboxSelect>>", self.on_group_select)
         make_button(left, "新建群聊", self.create_group, True).pack(fill="x", pady=2)
         make_button(left, "邀请成员进群", self.invite_members).pack(fill="x", pady=2)
+        make_button(left, "群设置 / 管理", self.show_group_settings).pack(fill="x", pady=2)
         make_button(left, "刷新", self.refresh_chat).pack(fill="x", pady=2)
+        ttk.Label(left, text="提示：群内发的协作表格\n只有群成员能看到和编辑",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
 
         center = ttk.Frame(f, padding=(8, 0))
         center.pack(side="left", fill="both", expand=True)
@@ -247,6 +252,9 @@ class LanExcelApp:
         self.chat_text.tag_configure("body", foreground="#1A1A1A")
         self.chat_text.tag_configure("muted", foreground="#7A7A7A")
         self.chat_text.tag_configure("link", foreground="#0067C0", underline=1)
+        self.chat_text.tag_configure("recalled", foreground="#9A9A9A")
+        self.chat_text.tag_configure("atall", foreground="#C42B1C")
+        self.chat_text.tag_configure("role", foreground="#8E562E")
 
         entry = ttk.Frame(center)
         entry.pack(fill="x", pady=(8, 4))
@@ -254,6 +262,8 @@ class LanExcelApp:
         self.chat_entry.pack(side="left", fill="x", expand=True)
         self.chat_entry.bind("<Return>", lambda e: self.send_chat_text())
         make_button(entry, "发送", self.send_chat_text, True).pack(side="left", padx=6)
+        self.atall_btn = make_button(entry, "@所有人", self.send_at_all)
+        self.atall_btn.pack(side="left", padx=(0, 6))
 
         tools = ttk.Frame(center)
         tools.pack(fill="x")
@@ -261,7 +271,7 @@ class LanExcelApp:
                           ("本地表格转协作表", self.send_local_sheet),
                           ("发送文件到群", self.send_file_group)]:
             make_button(tools, text, cmd).pack(side="left", padx=(0, 6))
-        ttk.Label(tools, text="群内文件不限大小，分块直连发送",
+        ttk.Label(tools, text="群内表格仅成员可见 · 文件不限大小 · 右键消息可撤回",
                   style="Muted.TLabel").pack(side="left", padx=6)
 
         right = ttk.LabelFrame(f, text="  群成员 / 文件传输  ", padding=8, width=236)
@@ -638,20 +648,37 @@ class LanExcelApp:
     def _append_message(self, m):
         if m.get("gid") != self.current_gid:
             return
+        mid = m.get("id", "")
+        if mid and mid in self._rendered_mids:
+            # 老消息状态变化（被撤回）：标记需要整体重绘，由 refresh_chat 统一处理
+            self._need_rebuild = True
+            return
+        if mid:
+            self._rendered_mids.add(mid)
         t = self.chat_text
         t.configure(state="normal")
+        start = t.index("end-1c")
         photo = self._avatar_for(m.get("from", ""), m.get("avatar_data", ""))
         if photo:
             t.image_create("end", image=photo)
         stamp = time.strftime("%H:%M:%S", time.localtime(m.get("ts", time.time())))
         t.insert("end", "  %s  %s\n" % (m.get("from_name") or "同伴", stamp), "name")
         kind = m.get("kind")
-        if kind == "text":
+        if m.get("recalled"):
+            who = m.get("recalled_by_name") or m.get("from_name") or "同伴"
+            if kind == "file":
+                t.insert("end", "  [已撤回] %s 撤回了一个文件（%s）\n\n"
+                         % (who, m.get("file", "")), "recalled")
+            else:
+                t.insert("end", "  [已撤回] %s 撤回了一条消息\n\n" % who, "recalled")
+        elif kind == "text":
+            if m.get("at_all"):
+                t.insert("end", "  @所有人 ", ("body", "atall"))
             t.insert("end", "  %s\n\n" % m.get("text", ""), "body")
         elif kind == "system":
             t.insert("end", "  %s\n\n" % m.get("text", ""), "muted")
         elif kind == "sheet":
-            t.insert("end", "  [协作表格] %s · %s 格\n"
+            t.insert("end", "  [协作表格·仅群成员可见] %s · %s 格\n"
                      % (m.get("room", ""), m.get("cells", 0)), "body")
             tag = "jump_%s" % m.get("seq")
             t.insert("end", "  打开这张协作表格\n\n", ("link", tag))
@@ -668,13 +695,56 @@ class LanExcelApp:
                            lambda e, p=path: self.open_path(p))
             else:
                 t.insert("end", "\n", "body")
+        end = t.index("end-1c")
+        tag = "msg_%s" % m.get("seq")
+        t.tag_add(tag, start, end)
+        t.tag_bind(tag, "<Button-3>", lambda e, mm=m: self._msg_menu(e, mm))
         t.configure(state="disabled")
         t.see("end")
 
+    def _msg_menu(self, event, m):
+        """消息右键：撤回（发送者本人或群管理员，不限时间）"""
+        if m.get("kind") == "system":
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        if m.get("recalled"):
+            menu.add_command(label="该消息已撤回", state="disabled")
+        elif self.node.can_recall(m):
+            label = "撤回这个文件" if m.get("kind") == "file" else "撤回这条消息"
+            menu.add_command(label=label, command=lambda: self._do_recall(m))
+        else:
+            menu.add_command(label="只有发送者或群管理员可撤回", state="disabled")
+        if m.get("kind") == "file" and m.get("path") and os.path.exists(m["path"]):
+            menu.add_command(label="打开文件", command=lambda: self.open_path(m["path"]))
+        if m.get("kind") == "sheet" and m.get("room"):
+            menu.add_command(label="打开协作表格",
+                             command=lambda: self.jump_to_sheet(m["room"]))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _do_recall(self, m):
+        tip = "确定撤回这条消息？\n撤回不限时间。"
+        if m.get("kind") == "file":
+            tip = ("确定撤回这个文件？\n"
+                   "文件会同时从各成员已接收的下载目录中删除，\n"
+                   "但已经被打开或另存到别处的副本无法收回。")
+        if not messagebox.askyesno("撤回", tip, parent=self.root):
+            return
+        try:
+            self.node.recall_message(m.get("id"))
+        except Exception as e:
+            messagebox.showerror("撤回失败", str(e), parent=self.root)
+            return
+        self.rebuild_chat()
+
     def rebuild_chat(self):
+        self._need_rebuild = False
         self.chat_text.configure(state="normal")
         self.chat_text.delete("1.0", "end")
         self.chat_text.configure(state="disabled")
+        self._rendered_mids = set()
         with self.node.chat_lock:
             hist = [dict(m) for m in self.node.chat_log
                     if m.get("gid") == self.current_gid]
@@ -692,7 +762,17 @@ class LanExcelApp:
             self.group_ids = [g["id"] for g in mine]
             self.group_list.delete(0, "end")
             for g in mine:
-                self.group_list.insert("end", " %s (%d)" % (g["name"], g["count"]))
+                mark = ""
+                if g["dissolved"]:
+                    mark = " ·已解散"
+                elif g["is_owner"]:
+                    mark = " ·群主"
+                elif g["is_admin"]:
+                    mark = " ·管理"
+                if g["can_manage"] and g["pending_count"]:
+                    mark += " ·待审%d" % g["pending_count"]
+                self.group_list.insert("end", " %s (%d)%s"
+                                       % (g["name"], g["count"], mark))
             if self.current_gid in self.group_ids:
                 self.group_list.selection_set(self.group_ids.index(self.current_gid))
             elif mine:
@@ -704,6 +784,9 @@ class LanExcelApp:
             self.refresh_members()
         for m in d["messages"]:
             self._append_message(m)
+        if self._need_rebuild:
+            self._need_rebuild = False
+            self.rebuild_chat()
         tree = self.transfer_tree
         for item in tree.get_children():
             tree.delete(item)
@@ -715,7 +798,13 @@ class LanExcelApp:
         if mine:
             cur = next((g for g in mine if g["id"] == self.current_gid), None)
             if cur:
-                self.chat_title.set("%s · %d 人" % (cur["name"], cur["count"]))
+                role = "群主" if cur["is_owner"] else ("管理员" if cur["is_admin"] else "成员")
+                state = " · 已解散" if cur["dissolved"] else ""
+                self.chat_title.set("%s · %d 人 · 我是%s%s"
+                                    % (cur["name"], cur["count"], role, state))
+                if cur["can_manage"] and cur["pending_count"]:
+                    self.chat_title.set(self.chat_title.get() +
+                                        " · %d 人待审核" % cur["pending_count"])
         else:
             self.chat_title.set("还没有群聊，点击左侧「新建群聊」")
 
@@ -724,13 +813,17 @@ class LanExcelApp:
         cur = next((g for g in self.group_data if g["id"] == self.current_gid), None)
         if not cur:
             return
+        owner = cur["owner"]
+        admins = set(cur["admins"])
         for pid in cur["members"]:
+            role = " [群主]" if pid == owner else (" [管理员]" if pid in admins else "")
             if pid == self.node.id:
-                self.member_list.insert("end", " %s (我)" % self.node.name)
+                self.member_list.insert("end", " %s%s (我)" % (self.node.name, role))
                 continue
             with self.node.peers_lock:
                 p = self.node.peers.get(pid, {})
-            self.member_list.insert("end", " %s" % (p.get("name") or pid[:8]))
+            self.member_list.insert("end", " %s%s"
+                                    % (p.get("name") or pid[:8], role))
 
     def on_group_select(self, event=None):
         sel = self.group_list.curselection()
@@ -741,6 +834,219 @@ class LanExcelApp:
             self.current_gid = gid
             self.rebuild_chat()
             self.refresh_members()
+
+    # ------------------------------------------------------------ 群设置 / 管理
+    def _current_group(self):
+        return next((g for g in self.group_data if g["id"] == self.current_gid), None)
+
+    def show_group_settings(self):
+        cur = self._current_group()
+        if not cur:
+            self._alert("请先选中或新建一个群聊")
+            return
+        top = tk.Toplevel(self.root)
+        top.title("群设置 · " + cur["name"])
+        top.geometry("640x640")
+        top.transient(self.root)
+        top.grab_set()
+
+        role = "群主" if cur["is_owner"] else ("管理员" if cur["is_admin"] else "普通成员")
+        head = ttk.Frame(top, padding=(16, 14, 16, 6))
+        head.pack(fill="x")
+        ttk.Label(head, text=cur["name"], font=(FONT, 13, "bold")).pack(anchor="w")
+        ttk.Label(head, text="%d 人 · 我是%s · 进群方式：%s"
+                            % (cur["count"], role,
+                               "需管理员审核" if cur["join_mode"] == "approval" else "可直接加入"),
+                  style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
+        if cur["dissolved"]:
+            ttk.Label(head, text="该群已解散：只能查看历史记录，协作表格已失效",
+                      foreground="#C42B1C").pack(anchor="w", pady=(4, 0))
+
+        body = ttk.Frame(top, padding=(16, 0))
+        body.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(body, text="  群成员  ", padding=8)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        member_box = tk.Listbox(left, height=15, activestyle="none")
+        member_box.pack(fill="both", expand=True)
+        owner = cur["owner"]
+        admins = set(cur["admins"])
+        member_ids = list(cur["members"])
+        for pid in member_ids:
+            role_tag = " [群主]" if pid == owner else (" [管理员]" if pid in admins else "")
+            if pid == self.node.id:
+                name = "%s (我)" % self.node.name
+            else:
+                with self.node.peers_lock:
+                    p = self.node.peers.get(pid, {})
+                name = p.get("name") or pid[:8]
+            member_box.insert("end", " %s%s" % (name, role_tag))
+
+        ops = ttk.Frame(left)
+        ops.pack(fill="x", pady=(8, 0))
+        can = cur["can_manage"]
+        b_admin = make_button(ops, "设为管理员", lambda: self._gs_admin(
+            top, member_box, member_ids, True))
+        b_admin.pack(fill="x", pady=2)
+        b_unadmin = make_button(ops, "取消管理员", lambda: self._gs_admin(
+            top, member_box, member_ids, False))
+        b_unadmin.pack(fill="x", pady=2)
+        b_kick = make_button(ops, "移出群聊", lambda: self._gs_kick(
+            top, member_box, member_ids))
+        b_kick.pack(fill="x", pady=2)
+        if not can:
+            for b in (b_admin, b_unadmin, b_kick):
+                b.configure(state="disabled")
+        if not cur["is_owner"]:
+            b_admin.configure(state="disabled")
+            b_unadmin.configure(state="disabled")
+
+        right = ttk.LabelFrame(body, text="  进群审核  ", padding=8)
+        right.pack(side="right", fill="both", expand=True)
+        approve_var = tk.BooleanVar(value=(cur["join_mode"] == "approval"))
+        cb = ttk.Checkbutton(right, text="进群需要管理员审核",
+                             variable=approve_var,
+                             command=lambda: self._gs_joinmode(top, approve_var))
+        cb.pack(anchor="w")
+        if not can:
+            cb.configure(state="disabled")
+        ttk.Label(right, text="待审核申请", style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
+        pend_box = tk.Listbox(right, height=8, activestyle="none")
+        pend_box.pack(fill="both", expand=True)
+        pend_ids = [p["id"] for p in cur.get("pending") or []]
+        for p in cur.get("pending") or []:
+            name = p.get("name") or p["id"][:8]
+            if p["id"] == self.node.id:
+                name += " (我)"
+            pend_box.insert("end", " " + name)
+        if not pend_ids:
+            pend_box.insert("end", " （暂无待审核申请）")
+        arow = ttk.Frame(right)
+        arow.pack(fill="x", pady=(6, 0))
+        b_ok = make_button(arow, "同意", lambda: self._gs_approve(
+            top, pend_box, pend_ids, True))
+        b_ok.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        b_no = make_button(arow, "拒绝", lambda: self._gs_approve(
+            top, pend_box, pend_ids, False))
+        b_no.pack(side="left", fill="x", expand=True)
+        if not can or not pend_ids:
+            b_ok.configure(state="disabled")
+            b_no.configure(state="disabled")
+
+        # 邀请 / 加入
+        mid_row = ttk.Frame(top, padding=(16, 8, 16, 0))
+        mid_row.pack(fill="x")
+        if not cur["dissolved"]:
+            make_button(mid_row, "邀请成员进群",
+                        lambda: (top.destroy(), self.invite_members())).pack(
+                side="left", padx=(0, 6))
+
+        foot = ttk.Frame(top, padding=(16, 10, 16, 14))
+        foot.pack(fill="x", side="bottom")
+        if cur["is_owner"] and not cur["dissolved"]:
+            make_button(foot, "解散群聊", lambda: self._gs_dissolve(top),
+                        False).pack(side="left")
+        elif not cur["is_owner"] and not cur["dissolved"]:
+            make_button(foot, "退出群聊", lambda: self._gs_leave(top)).pack(side="left")
+        make_button(foot, "关闭", top.destroy, True).pack(side="right")
+
+    def _gs_refresh(self, top, gid=None):
+        top.destroy()
+        self._groups_sig = ""
+        self.refresh_chat()
+
+    def _gs_admin(self, top, box, ids, on):
+        sel = box.curselection()
+        if not sel or sel[0] >= len(ids):
+            return
+        pid = ids[sel[0]]
+        try:
+            self.node.set_admin(self.current_gid, pid, on)
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e), parent=top)
+            return
+        self._gs_refresh(top)
+
+    def _gs_kick(self, top, box, ids):
+        sel = box.curselection()
+        if not sel or sel[0] >= len(ids):
+            return
+        pid = ids[sel[0]]
+        if not messagebox.askyesno("移出群聊",
+                                   "确定把该成员移出群聊？\n"
+                                   "移出后他立即看不到群内消息和协作表格。",
+                                   parent=top):
+            return
+        try:
+            self.node.kick_member(self.current_gid, pid)
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e), parent=top)
+            return
+        self._gs_refresh(top)
+
+    def _gs_approve(self, top, box, ids, ok):
+        sel = box.curselection()
+        if not sel or sel[0] >= len(ids):
+            return
+        try:
+            self.node.approve_join(self.current_gid, ids[sel[0]], ok)
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e), parent=top)
+            return
+        self._gs_refresh(top)
+
+    def _gs_joinmode(self, top, var):
+        try:
+            self.node.set_join_mode(self.current_gid,
+                                    "approval" if var.get() else "free")
+        except Exception as e:
+            messagebox.showerror("操作失败", str(e), parent=top)
+            return
+        self._groups_sig = ""
+        self.refresh_chat()
+        top.destroy()
+
+    def _gs_dissolve(self, top):
+        if not messagebox.askyesno(
+                "解散群聊",
+                "确定解散该群聊？\n\n"
+                "· 所有成员将看不到群内消息与协作表格\n"
+                "· 群内共享的协作表格立即失效\n"
+                "· 该操作不可撤销",
+                parent=top):
+            return
+        try:
+            self.node.dissolve_group(self.current_gid)
+        except Exception as e:
+            messagebox.showerror("解散失败", str(e), parent=top)
+            return
+        self._gs_refresh(top)
+
+    def _gs_leave(self, top):
+        if not messagebox.askyesno("退出群聊", "确定退出该群聊？", parent=top):
+            return
+        try:
+            self.node.leave_group(self.current_gid)
+        except Exception as e:
+            messagebox.showerror("退出失败", str(e), parent=top)
+            return
+        self.current_gid = ""
+        self._gs_refresh(top)
+
+    def send_at_all(self):
+        cur = self._current_group()
+        if not cur:
+            self._alert("请先选中或新建一个群聊")
+            return
+        if not cur["is_admin"]:
+            self._alert("只有群主或管理员可以 @所有人")
+            return
+        text = self.chat_input.get().strip() or "请注意查看群消息"
+        try:
+            self.node.at_all(self.current_gid, text)
+        except Exception as e:
+            messagebox.showerror("发送失败", str(e))
+            return
+        self.chat_input.set("")
 
     def create_group(self):
         name = simpledialog.askstring("新建群聊", "群聊名称:",
@@ -811,8 +1117,12 @@ class LanExcelApp:
         return result["value"]
 
     def send_chat_text(self):
-        if not self.current_gid:
+        cur = self._current_group()
+        if not self.current_gid or not cur:
             self._alert("请先选中或新建一个群聊")
+            return
+        if cur["dissolved"]:
+            self._alert("该群聊已解散，无法发送消息")
             return
         text = self.chat_input.get().strip()
         if not text:

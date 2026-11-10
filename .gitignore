@@ -10,9 +10,9 @@ lanexcel_chat.json
 # ---- 构建产物 ----
 *.spec
 build/
-dist/
 .venv*/
 venv/
+# dist/ 里的 exe 成品需要入库；其下运行期残留已由上方规则统一排除
 
 # ---- 依赖（用 requirements.txt 安装，不入库）----
 lib/

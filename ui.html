@@ -225,6 +225,7 @@
       <button class="mini" onclick="newGroup()">建群</button>
       <button class="mini" onclick="openInvite()">邀请</button>
       <button class="mini" onclick="openGroupSettings()">群设置</button>
+      <button class="mini" onclick="deleteGroup()">删除群聊</button>
       <button class="mini" onclick="toggleChat()">×</button>
     </div>
     <div id="gset" style="display:none"></div>
@@ -1109,6 +1110,8 @@ function renderGroupSettings(){
     const l=document.createElement("button"); l.textContent="退出群聊";
     l.onclick=leaveGroup; foot.appendChild(l);
   }
+  const del=document.createElement("button"); del.textContent="删除群聊";
+  del.onclick=deleteGroup; foot.appendChild(del);
   box.appendChild(foot);
 }
 function afterGroupOp(d){
@@ -1139,6 +1142,28 @@ function leaveGroup(){
     if(!d.ok){ toast("退出失败: "+(d.error||"")); return; }
     curGid=""; chatSeq=0; $("chatmsg").innerHTML=""; msgSeen.clear(); pollChat();
     $("gset").style.display="none";
+  });
+}
+function deleteGroup(){
+  if(!needGroup()) return;
+  const g = chatGroups.find(x=>x.id===curGid);
+  let tip = "确定把该群聊从列表删除？\n\n· 本机列表不再显示，本地聊天记录清空";
+  if(g && !g.dissolved && g.is_owner){
+    tip = "确定删除群聊「"+g.name+"」？\n\n你是群主，删除将同时【解散】该群：\n"
+        + "· 所有成员立即看不到群消息，群内协作表格同时失效\n"
+        + "· 本机列表移除该群，本地聊天记录清空\n· 该操作不可撤销";
+  } else if(g && !g.dissolved){
+    tip = "确定删除群聊「"+g.name+"」？\n\n你不是群主，删除将同时【退出】该群：\n"
+        + "· 退出后看不到群消息与群内协作表格，其他成员不受影响\n"
+        + "· 本机列表移除该群，本地聊天记录清空";
+  }
+  if(!confirm(tip)) return;
+  post("/api/group/delete",{gid:curGid}).then(d=>{
+    if(!d.ok){ toast("删除失败: "+(d.error||"")); return; }
+    curGid=""; chatSeq=0; $("chatmsg").innerHTML=""; msgSeen.clear();
+    $("gset").style.display="none";
+    pollChat();
+    toast((d.result&&d.result.note) || "已删除群聊");
   });
 }
 $("chatin").addEventListener("keydown", e=>{ if(e.key==="Enter") sendChatText(); });

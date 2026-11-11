@@ -73,6 +73,9 @@ class CollabMixin:
         # gid -> {id,name,owner,members:set,admins:set,removed:{pid:ts},
         #         join_mode,pending:{pid:{id,name,ts}},dissolved,rev,updated,editor,created}
         self.groups = {}
+        # 本机已「删除」的群：gid -> {"rev": 删除时的群版本, "ts": 时间}
+        # 群资料仍会在网上广播，但本机不再显示；被重新邀请（rev 变大且我在成员里）时自动恢复
+        self.hidden_groups = {}
         self.groups_lock = threading.RLock()
         self.chat_log = []                     # 消息（含本地 seq）
         self.chat_seen = set()                 # 全局唯一消息 id，去重
@@ -106,8 +109,16 @@ class CollabMixin:
                     removed[str(k)] = float(v)
                 except (TypeError, ValueError):
                     removed[str(k)] = 0.0
-        members -= set(removed)
-        admins -= set(removed)
+        # 主动退出者的墓碑：和「被踢」分开记，退出的人可被重新邀请或自行申请
+        left = {}
+        for k, v in (info.get("left") or {}).items():
+            if k:
+                try:
+                    left[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    left[str(k)] = 0.0
+        members -= set(removed) | set(left)
+        admins -= set(removed) | set(left)
         pending = {}
         for k, v in (info.get("pending") or {}).items():
             if not k:
@@ -128,6 +139,7 @@ class CollabMixin:
             "members": members,
             "admins": admins,
             "removed": removed,
+            "left": left,
             "pending": pending,
             "join_mode": join_mode,
             "dissolved": bool(info.get("dissolved")),
@@ -151,6 +163,7 @@ class CollabMixin:
                 "members": sorted(g["members"]),
                 "admins": sorted(g["admins"]),
                 "removed": dict(g["removed"]),
+                "left": dict(g.get("left") or {}),
                 "pending": {k: dict(v) for k, v in g["pending"].items()},
                 "join_mode": g["join_mode"],
                 "dissolved": g["dissolved"],
@@ -181,10 +194,11 @@ class CollabMixin:
             "pending_count": len(pending),
         }
 
-    def groups_public(self):
+    def groups_public(self, with_hidden=False):
         with self.groups_lock:
             gs = list(self.groups.values())
-        out = [self.group_public(g) for g in gs]
+            hidden = set(self.hidden_groups) if not with_hidden else set()
+        out = [self.group_public(g) for g in gs if g["id"] not in hidden]
         out.sort(key=lambda x: (x["dissolved"], x["created"]))
         return out
 
@@ -235,25 +249,32 @@ class CollabMixin:
                 self.groups[gid] = remote
             elif self._gkey(remote) > self._gkey(g):
                 # 新版本：整体接管，但成员取并集（并发邀请不丢），
-                # 再减去双方墓碑（踢掉的人不会被旧广播加回来）
+                # 再减去双方墓碑（踢掉 / 退出的人不会被旧广播加回来）
                 members = set(g["members"]) | set(remote["members"])
                 removed = dict(g["removed"])
                 removed.update(remote["removed"])
+                left = dict(g.get("left") or {})
+                left.update(remote.get("left") or {})
                 admins = set(remote["admins"])
-                members -= set(removed)
-                admins -= set(removed)
+                members -= set(removed) | set(left)
+                admins -= set(removed) | set(left)
                 g.update(remote)
                 g["members"] = members
                 g["admins"] = admins
                 g["removed"] = removed
+                g["left"] = left
             else:
-                # 同版本或旧版本：只做无损合并，绝不回滚踢人/解散
+                # 同版本或旧版本：只做无损合并，绝不回滚踢人/退出/解散
                 members = set(g["members"]) | set(remote["members"])
                 removed = dict(g["removed"])
                 removed.update(remote["removed"])
-                g["members"] = members - set(removed)
+                left = dict(g.get("left") or {})
+                left.update(remote.get("left") or {})
+                g["members"] = members - set(removed) - set(left)
+                g["left"] = left
                 if remote.get("dissolved"):
                     g["dissolved"] = True
+        self._maybe_unhide(gid, remote)
         self._save_chat()
 
     def _merge_group_list(self, infos):
@@ -269,6 +290,11 @@ class CollabMixin:
                 if not g.get("id"):
                     continue
                 self.groups[g["id"]] = self._group_norm(g)
+            for gid, h in (data.get("hidden_groups") or {}).items():
+                if gid:
+                    self.hidden_groups[str(gid)] = {
+                        "rev": int((h or {}).get("rev") or 0),
+                        "ts": float((h or {}).get("ts") or 0)}
             for m in data.get("messages", []):
                 mid = m.get("id") or uuid.uuid4().hex
                 if mid in self.chat_seen:
@@ -310,7 +336,8 @@ class CollabMixin:
                 os.makedirs(os.path.dirname(self._chat_path), exist_ok=True)
                 tmp = self._chat_path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump({"groups": groups, "messages": msgs},
+                    json.dump({"groups": groups, "messages": msgs,
+                               "hidden_groups": dict(self.hidden_groups)},
                               f, ensure_ascii=False)
                 os.replace(tmp, self._chat_path)
             except Exception:
@@ -362,6 +389,7 @@ class CollabMixin:
             for pid in cand:
                 g["members"].add(pid)
                 g["removed"].pop(pid, None)
+                g["left"].pop(pid, None)
                 g["pending"].pop(pid, None)
             self._bump(g)
             names = [self._peer_name(p) for p in cand]
@@ -380,6 +408,7 @@ class CollabMixin:
             if g["join_mode"] == JOIN_FREE:
                 g["members"].add(self.id)
                 g["removed"].pop(self.id, None)
+                g["left"].pop(self.id, None)
                 g["pending"].pop(self.id, None)
                 self._bump(g)
                 joined = True
@@ -389,6 +418,8 @@ class CollabMixin:
                 self._bump(g)
                 joined = False
         if joined:
+            with self.groups_lock:
+                self.hidden_groups.pop(gid, None)   # 自己主动进群：重新显示
             self._add_message(gid, "system", text="%s 加入了群聊" % self.name)
         else:
             self._add_message(gid, "system",
@@ -407,6 +438,7 @@ class CollabMixin:
                     raise ValueError("该成员已被移出群聊，请使用「邀请成员」")
                 g["members"].add(pid)
                 g["removed"].pop(pid, None)
+                g["left"].pop(pid, None)
             self._bump(g)
         nm = (rec or {}).get("name") or self._peer_name(pid)
         self._add_message(gid, "system",
@@ -430,6 +462,7 @@ class CollabMixin:
             g["members"].discard(pid)
             g["admins"].discard(pid)
             g["pending"].pop(pid, None)
+            g["left"].pop(pid, None)
             g["removed"][pid] = time.time()    # 墓碑：防止旧广播把人加回来
             self._bump(g)
         nm = self._peer_name(pid)
@@ -490,9 +523,80 @@ class CollabMixin:
         with self.groups_lock:
             g["members"].discard(self.id)
             g["admins"].discard(self.id)
+            g["left"][self.id] = time.time()   # 墓碑：旧广播不会把人加回来
             self._bump(g)
         self._add_message(gid, "system", text="%s 退出了群聊" % self.name)
         return self._publish_group(g)
+
+    # ------------------------------------------------------------ 删除群聊（本机）
+    def hide_group(self, gid):
+        """把群从本机列表删除：不再显示、不再收它的消息，并清掉本地聊天记录。
+
+        只是本机行为：群资料仍可能在网络上被同伴广播过来，但本机保持不显示，
+        直到有更高版本（rev 变大）且自己又出现在成员列表里（被重新邀请）。
+        """
+        gid = str(gid or "")
+        with self.groups_lock:
+            g = self.groups.get(gid)
+            rev = int((g or {}).get("rev") or 0)
+            self.hidden_groups[gid] = {"rev": rev, "ts": time.time()}
+        purged = []
+        with self.chat_lock:
+            keep = []
+            for m in self.chat_log:
+                if m.get("gid") == gid:
+                    purged.append(m)
+                else:
+                    keep.append(m)
+            self.chat_log = keep
+            for m in purged:
+                self.chat_index.pop(m.get("id"), None)
+                self.chat_seen.discard(m.get("id"))
+        self._save_chat()
+        return {"gid": gid, "hidden": True, "rev": rev, "purged": len(purged)}
+
+    def delete_group(self, gid, mode="auto"):
+        """删除群聊：群主 = 解散并删除；成员 = 退出并删除；其它 = 仅从本机列表删除。
+
+        mode: auto / dissolve / leave / hide
+        """
+        g = self._need_group(gid)
+        me = self.id
+        dissolved = bool(g["dissolved"])
+        is_owner = bool(g["owner"] == me)
+        in_group = bool(me in g["members"])
+        if mode not in ("auto", "dissolve", "leave", "hide"):
+            mode = "auto"
+        action = "hide"
+        if not dissolved:
+            want_dissolve = mode == "dissolve" or (
+                mode == "auto" and is_owner)
+            want_leave = mode == "leave" or (
+                mode == "auto" and in_group and not is_owner)
+            if want_dissolve:
+                self.dissolve_group(gid)      # 内部已做「只有群主可以解散」校验
+                action = "dissolve"
+            elif want_leave:
+                self.leave_group(gid)         # 内部已做「群主不能退出」校验
+                action = "leave"
+        info = self.hide_group(gid)
+        note = {"dissolve": "已解散群聊并从本机列表删除（其他成员立即看不到群消息与群内表格）",
+                "leave": "已退出群聊并从本机列表删除",
+                "hide": "已从本机列表删除该群聊"}[action]
+        info.update({"action": action, "note": note, "name": g["name"]})
+        return info
+
+    def _maybe_unhide(self, gid, remote):
+        """被重新邀请（版本更新且自己在成员里）时，自动把群恢复显示"""
+        h = self.hidden_groups.get(gid)
+        if not h or remote.get("dissolved"):
+            return
+        if self.id not in remote.get("members", ()):
+            return
+        if int(remote.get("rev") or 0) > int(h.get("rev") or 0):
+            with self.groups_lock:
+                self.hidden_groups.pop(gid, None)
+            self._save_chat()
 
     def at_all(self, gid, text=""):
         """@所有人：仅群主/管理员可用"""
@@ -565,6 +669,9 @@ class CollabMixin:
         gid = getattr(room, "group_id", None)
         if not gid:
             return True                      # 公开房间，保持原有协作方式
+        if pid == self.id and gid in self.hidden_groups:
+            # 本机已删除该群聊（退出 / 解散 / 从列表删除）：群内表格也不再显示
+            return False
         with self.groups_lock:
             g = self.groups.get(gid)
         if g is not None:
@@ -1061,7 +1168,8 @@ class CollabMixin:
         """只有本人是成员的群才同步给该节点（未进群的群资料不外泄）"""
         with self.groups_lock:
             return [self._group_full(g) for g in self.groups.values()
-                    if pid and pid in g["members"]]
+                    if pid and pid in g["members"]
+                    and g["id"] not in self.hidden_groups]
 
     def _visible_messages_for(self, pid, limit=120):
         with self.groups_lock:
@@ -1147,7 +1255,8 @@ class CollabMixin:
     def chat_since(self, seq=0):
         with self.groups_lock:
             mine_ids = set(g["id"] for g in self.groups.values()
-                           if self.id in g["members"])
+                           if self.id in g["members"]
+                           and g["id"] not in self.hidden_groups)
         with self.chat_lock:
             msgs = [dict(m) for m in self.chat_log
                     if (m.get("seq", 0) > seq or m.get("rev", 0) > seq)

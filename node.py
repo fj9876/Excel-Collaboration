@@ -242,6 +242,8 @@ class Room:
 
     def cell_hidden(self, r, c, viewer):
         """该单元格对 viewer 是否显示为星号（读不到真实内容）"""
+        if not self.owner_id:
+            return False                      # 还不知道发布者是谁：先不遮掩，避免误清真值
         if viewer == self.owner_id:
             return False                      # 发布者看全部
         if not self.cell_private(r, c):
@@ -326,7 +328,7 @@ class Room:
                 if cell is None:
                     continue
                 k = "%d,%d" % (r, c)
-                if self.cell_hidden(r, c, viewer):
+                if self.cell_hidden(r, c, viewer) or (r, c) in self.masked:
                     if not mask_only:
                         out[k] = ["", cell[1], cell[2], 1]
                 elif not mask_only:
@@ -665,6 +667,10 @@ class Node(CollabMixin):
                 cur = room.cells.get((r, c))
                 # 本地只是占位（真值在别人机器上）时，任何一份真值都该收下
                 placeholder = ((r, c) in room.masked or force_real) and not hidden
+                # 发布者自己：别人送来的「遮掩占位」不能覆盖本机真值
+                if hidden and room.owner_id and self.id == room.owner_id \
+                        and cur is not None and cur[0]:
+                    continue
                 if cur is None or placeholder or (ts, who) > (cur[1], cur[2]):
                     if hidden:
                         room.cells[(r, c)] = ["", ts, who]
@@ -683,12 +689,34 @@ class Node(CollabMixin):
         if changed:
             with room.lock:
                 room.seq += 1
-                room.edit_log.append({"seq": room.seq, "cells": changed})
+                room.edit_log.append({"seq": room.seq,
+                                      "cells": self._masked_for_log(room, changed)})
+
+    @staticmethod
+    def _masked_for_log(room, changed):
+        """写进 edit_log 的单元格：本机遮掩的要标成四元组占位
+
+        否则同伴会把它当成「真的写入了空字符串」，用一个同时间戳的空值
+        顶掉自己手里的真值，发布者就再也收不回别人的内容了。
+        """
+        out = {}
+        masked = getattr(room, "masked", set())
+        for key, cell in (changed or {}).items():
+            if len(cell) > 3:
+                out[key] = cell
+                continue
+            try:
+                r, c = [int(x) for x in str(key).split(",")]
+            except (AttributeError, ValueError):
+                out[key] = cell
+                continue
+            out[key] = (["", cell[1], cell[2], 1] if (r, c) in masked else cell)
+        return out
 
     def _scrub_private(self, room):
         """把本机不该看见的隐私真值清成占位（隐私开启时调用）"""
         changed = {}
-        if not room.privacy_on():
+        if not room.privacy_on() or not room.owner_id:
             return changed
         with room.lock:
             for (r, c), cell in list(room.cells.items()):
@@ -738,7 +766,8 @@ class Node(CollabMixin):
         if changed:
             with room.lock:
                 room.seq += 1
-                room.edit_log.append({"seq": room.seq, "cells": changed})
+                room.edit_log.append({"seq": room.seq,
+                                      "cells": self._masked_for_log(room, changed)})
         return changed
 
     def set_privacy(self, room_name, rows=None, cols=None, on=True):
@@ -1251,12 +1280,25 @@ class Node(CollabMixin):
                         pass
             time.sleep(3)
 
+    def _owner_placeholder_rooms(self):
+        """本机是发布者、但手里仍有占位格的房间（需要自愈）"""
+        out = []
+        with self.rooms_lock:
+            rooms = list(self.rooms.values())
+        for r in rooms:
+            if r.masked and (r.owner_id or "") == self.id:
+                out.append(r.name)
+        return out
+
     def antientropy_loop(self):
         while self.running:
             with self.rooms_lock:
                 has_rooms = bool(self.rooms)
             if has_rooms:
                 self.broadcast_rooms()
+                # 发布者本机不该有占位格：早期竞态留下的占位靠一次全量收回真值
+                for name in self._owner_placeholder_rooms():
+                    self.broadcast({"t": "state_req", "room": name})
             self.broadcast({"t": "presence", "id": self.id,
                             "name": self.name, "color": self.color,
                             "note": self.note,
@@ -1651,8 +1693,10 @@ class Node(CollabMixin):
         for key, cell in cells.items():
             v, ts, who, hidden = self._cell_parts(cell)
             r, c = room._key_rc(key)
-            if not hidden and viewer != room.owner_id and room.cell_private(r, c) \
-                    and who != viewer and (bool(v) or (r, c) in room.masked):
+            if not hidden and (r, c) in room.masked:
+                hidden = True           # 本机只是占位：转发时也不能当成真值
+            elif not hidden and viewer != room.owner_id and room.cell_private(r, c) \
+                    and who != viewer and bool(v):
                 hidden = True
             out[key] = ["", ts, who, 1] if hidden else [v, ts, who]
         return out
@@ -1966,6 +2010,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/group/leave":
                 self._json({"ok": True, "group": node.leave_group(
                     body.get("gid", ""))})
+            elif path == "/api/group/delete":
+                self._json({"ok": True, "result": node.delete_group(
+                    body.get("gid", ""), body.get("mode") or "auto")})
             elif path == "/api/group/apply":
                 self._json({"ok": True, "group": node.request_join(
                     body.get("gid", ""))})

@@ -371,13 +371,15 @@ class LanExcelApp:
         self.group_list.pack(fill="both", expand=True, pady=(0, 8))
         self.group_list.bind("<<ListboxSelect>>", self.on_group_select)
         self.group_list.bind("<Button-3>", self._group_menu)
+        self.group_list.bind("<Delete>", lambda e: self.delete_group_ui())
         make_button(left, "新建群聊", self.create_group, True).pack(fill="x", pady=2)
         make_button(left, "邀请成员进群", self.invite_members).pack(fill="x", pady=2)
         make_button(left, "群设置 / 管理", self.show_group_settings).pack(fill="x", pady=2)
         self.pin_btn = make_button(left, "置顶该群", self.toggle_pin_group)
         self.pin_btn.pack(fill="x", pady=2)
+        make_button(left, "删除群聊", self.delete_group_ui).pack(fill="x", pady=2)
         make_button(left, "刷新", self.refresh_chat).pack(fill="x", pady=2)
-        ttk.Label(left, text="右键群名可置顶 / 设置\n提示：群内发的协作表格\n只有群成员能看到和编辑",
+        ttk.Label(left, text="右键群名可置顶 / 删除\n提示：群内发的协作表格\n只有群成员能看到和编辑",
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=(10, 0))
 
         center = ttk.Frame(f, padding=(8, 0))
@@ -1681,6 +1683,58 @@ class LanExcelApp:
         self._groups_sig = ""
         self.refresh_chat()
 
+    def delete_group_ui(self, gid=None):
+        """删除群聊（本机列表）：群主 = 解散并删除；成员 = 退出并删除；已解散 = 仅移除"""
+        gid = gid or self._selected_gid() or self.current_gid
+        if not gid:
+            self._alert("请先在左侧群聊列表中选中要删除的群聊")
+            return
+        g = next((x for x in self.group_data if x["id"] == gid), None)
+        if g is None:
+            with self.node.groups_lock:
+                gg = self.node.groups.get(gid)
+            if gg is not None:
+                g = self.node.group_public(gg)
+        if g is None:
+            self._alert("该群聊已不存在")
+            return
+        name = g["name"]
+        if g["dissolved"]:
+            title = "删除群聊"
+            body = ("把群聊「%s」从本机列表删除？\n\n"
+                    "· 该群已解散，删除只影响本机：列表不再显示，本地聊天记录清空\n"
+                    "· 不会通知其他成员" % name)
+        elif g["is_owner"]:
+            title = "解散并删除群聊"
+            body = ("确定删除群聊「%s」？\n\n"
+                    "你是群主，删除将同时【解散】该群：\n"
+                    "· 所有成员立即看不到群消息，群内协作表格同时失效\n"
+                    "· 其他成员的列表里会显示「已解散」，他们可自行删除\n"
+                    "· 本机列表移除该群，本地聊天记录清空\n"
+                    "· 该操作不可撤销" % name)
+        else:
+            title = "退出并删除群聊"
+            body = ("确定删除群聊「%s」？\n\n"
+                    "你不是群主，删除将同时【退出】该群：\n"
+                    "· 退出后看不到群消息与群内协作表格，其他成员不受影响\n"
+                    "· 本机列表移除该群，本地聊天记录清空\n"
+                    "· 之后群主或管理员仍可再次邀请你入群" % name)
+        if not messagebox.askyesno(title, body, parent=self.root):
+            return
+        try:
+            r = self.node.delete_group(gid)
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e), parent=self.root)
+            return
+        self._groups_sig = ""
+        if self.current_gid == gid:
+            self.current_gid = ""
+            self.chat_since = 0
+        self.chat_title.set("群聊")
+        self.refresh_chat()
+        self.rebuild_chat()
+        self._alert(r.get("note", "已删除"))
+
     def _group_menu(self, event):
         idx = self.group_list.nearest(event.y)
         if idx < len(self.group_ids):
@@ -1697,6 +1751,16 @@ class LanExcelApp:
                                  command=self.show_group_settings)
                 menu.add_command(label="邀请成员进群",
                                  command=self.invite_members)
+            menu.add_separator()
+            if g and g["is_owner"] and not g["dissolved"]:
+                menu.add_command(label="删除群聊（解散并删除）",
+                                 command=lambda: self.delete_group_ui(gid))
+            elif g and not g["dissolved"]:
+                menu.add_command(label="删除群聊（退出并删除）",
+                                 command=lambda: self.delete_group_ui(gid))
+            else:
+                menu.add_command(label="删除群聊（从列表移除）",
+                                 command=lambda: self.delete_group_ui(gid))
             try:
                 menu.tk_popup(event.x_root, event.y_root)
             finally:
@@ -2012,6 +2076,8 @@ class LanExcelApp:
                         False).pack(side="left")
         elif not cur["is_owner"] and not cur["dissolved"]:
             make_button(foot, "退出群聊", lambda: self._gs_leave(top)).pack(side="left")
+        make_button(foot, "删除群聊", lambda: self._gs_delete(top)).pack(
+            side="left", padx=(6, 0))
         make_button(foot, "关闭", top.destroy, True).pack(side="right")
 
     def _gs_refresh(self, top, gid=None):
@@ -2096,6 +2162,12 @@ class LanExcelApp:
             return
         self.current_gid = ""
         self._gs_refresh(top)
+
+    def _gs_delete(self, top):
+        """群设置里的删除入口：先关掉对话框，再走统一的删除确认流程"""
+        gid = self.current_gid
+        top.destroy()
+        self.delete_group_ui(gid)
 
     def send_at_all(self):
         cur = self._current_group()

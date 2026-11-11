@@ -171,24 +171,25 @@ r = api(P["乙"], "/api/set", {"room": ROOM,
                               "cells": [{"r": 2, "c": 3, "v": "工资8000"},
                                         {"r": 2, "c": 4, "v": "乙的备注"}]})
 ok("乙 写入自己的隐私格 + 公开格", r.get("ok"), r)
-time.sleep(2.5)
 
-ok("甲（发布者）看到乙填的工资", value(P["甲"], ROOM, "2,3") == "工资8000",
+ok("甲（发布者）看到乙填的工资", wait_for(
+    lambda: value(P["甲"], ROOM, "2,3") == "工资8000", 20),
    cell_of(P["甲"], ROOM, "2,3"))
 ok("乙 自己看得到", value(P["乙"], ROOM, "2,3") == "工资8000")
-ok("丙 看到 ***（被遮掩）", hidden(P["丙"], ROOM, "2,3"),
+ok("丙 看到 ***（被遮掩）", wait_for(lambda: hidden(P["丙"], ROOM, "2,3"), 20),
    cell_of(P["丙"], ROOM, "2,3"))
 ok("丙 拿不到真实值", value(P["丙"], ROOM, "2,3") in ("", None),
    cell_of(P["丙"], ROOM, "2,3"))
-ok("公开列丙能看到", value(P["丙"], ROOM, "2,4") == "乙的备注",
+ok("公开列丙能看到", wait_for(
+    lambda: value(P["丙"], ROOM, "2,4") == "乙的备注", 20),
    cell_of(P["丙"], ROOM, "2,4"))
 
 # ---------------------------------------------------------------- 丙 越权
 r = api(P["丙"], "/api/set", {"room": ROOM,
                               "cells": [{"r": 2, "c": 3, "v": "篡改"}]})
 ok("丙 覆盖他人隐私格被拒绝", r.get("ok") is False and "隐私" in (r.get("error") or ""), r)
-time.sleep(1.5)
-ok("原值未被改动", value(P["甲"], ROOM, "2,3") == "工资8000",
+ok("原值未被改动", wait_for(
+    lambda: value(P["甲"], ROOM, "2,3") == "工资8000", 20),
    cell_of(P["甲"], ROOM, "2,3"))
 ok("丙 端仍是遮罩", hidden(P["丙"], ROOM, "2,3"))
 
@@ -196,18 +197,18 @@ ok("丙 端仍是遮罩", hidden(P["丙"], ROOM, "2,3"))
 r = api(P["丙"], "/api/set", {"room": ROOM,
                               "cells": [{"r": 3, "c": 3, "v": "工资9000"}]})
 ok("丙 填写自己的隐私格", r.get("ok"), r)
-time.sleep(2.5)
-ok("甲 看到丙填的", value(P["甲"], ROOM, "3,3") == "工资9000")
-ok("乙 看不到丙的（***）", hidden(P["乙"], ROOM, "3,3"),
+ok("甲 看到丙填的", wait_for(
+    lambda: value(P["甲"], ROOM, "3,3") == "工资9000", 20),
+   cell_of(P["甲"], ROOM, "3,3"))
+ok("乙 看不到丙的（***）", wait_for(lambda: hidden(P["乙"], ROOM, "3,3"), 20),
    cell_of(P["乙"], ROOM, "3,3"))
 ok("丙 自己看得到", value(P["丙"], ROOM, "3,3") == "工资9000")
 
 # 甲（发布者）可写任意隐私格
 r = api(P["甲"], "/api/set", {"room": ROOM,
                               "cells": [{"r": 4, "c": 3, "v": "待定"}]})
-time.sleep(2)
 ok("发布者写隐私格", r.get("ok") and value(P["甲"], ROOM, "4,3") == "待定", r)
-ok("乙 看不到发布者写的（***）", hidden(P["乙"], ROOM, "4,3"),
+ok("乙 看不到发布者写的（***）", wait_for(lambda: hidden(P["乙"], ROOM, "4,3"), 20),
    cell_of(P["乙"], ROOM, "4,3"))
 ok("但发布者自己看得到", value(P["甲"], ROOM, "4,3") == "待定")
 

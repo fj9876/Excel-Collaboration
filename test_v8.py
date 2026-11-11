@@ -56,7 +56,7 @@ def start_node(name, cfgdir):
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def api(port, path, body=None, timeout=10):
+def api(port, path, body=None, timeout=60):
     url = "http://127.0.0.1:%d%s" % (port, path)
     try:
         if body is None:
@@ -228,10 +228,10 @@ api(P["甲"], "/api/new", {"room": "公开表"})
 time.sleep(2)
 api(P["甲"], "/api/set", {"room": "公开表",
                           "cells": [{"r": 1, "c": 1, "v": "公开内容"}]})
-time.sleep(3)
-d = api(P["乙"], "/api/poll?since=0&room=" + urllib.parse.quote("公开表"))
-c = (d.get("cells") or {}).get("1,1")
-ok("公开表格照常全员可见", c and c[0] == "公开内容", c)
+ok("公开表格照常全员可见", wait_for(
+    lambda: (cell_of(P["乙"], "公开表", "1,1") or [None])[0] == "公开内容", 20),
+   cell_of(P["乙"], "公开表", "1,1"))
+c = cell_of(P["乙"], "公开表", "1,1")
 ok("公开表格没有被遮罩", not (c and len(c) > 3 and c[3]), c)
 ok("公开表格没有隐私设置",
    not (api(P["乙"], "/api/room/privacy?room=" + urllib.parse.quote("公开表"))

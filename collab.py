@@ -559,6 +559,9 @@ class CollabMixin:
         """房间对某个节点 id 是否可见/可编辑"""
         if room is None:
             return False
+        # v9 发布机制：草稿（未发布）只有本机可见，同伴既看不到也改不了
+        if not getattr(room, "published", True) and pid != self.id:
+            return False
         gid = getattr(room, "group_id", None)
         if not gid:
             return True                      # 公开房间，保持原有协作方式
@@ -738,6 +741,9 @@ class CollabMixin:
         r = self.get_room(room_name)
         if r is None:
             raise ValueError("协作表格不存在: " + str(room_name))
+        # 草稿房间发到群里 = 直接发布（发出去就要能看能填）
+        if not getattr(r, "published", True) and (r.owner_id or self.id) == self.id:
+            self.publish_room(room_name)
         self.bind_room_group(room_name, gid)      # 绑定后仅群成员可见
         self.broadcast_rooms()
         self._add_message(gid, "sheet",
@@ -747,7 +753,7 @@ class CollabMixin:
 
     def share_local_xlsx(self, gid, path):
         """把本地 Excel 发到群里变成协作表格：打开成群内房间 + 发卡片"""
-        info = self.open_xlsx(path, gid=gid)
+        info = self.open_xlsx(path, gid=gid, publish=True)
         self.bind_room_group(info["room"], gid)
         self._add_message(gid, "sheet",
                           text="%s 发送了本地表格「%s」，已转为协作表格"

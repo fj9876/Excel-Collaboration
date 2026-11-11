@@ -51,7 +51,7 @@ def start_node(name, cfgdir):
     procs.append(p)
     return p
 
-def api(port, path, body=None):
+def api(port, path, body=None, timeout=60):
     url = "http://127.0.0.1:%d%s" % (port, path)
     op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:

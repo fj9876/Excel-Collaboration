@@ -228,6 +228,10 @@ class Room:
         self.privacy = {"on": 0, "rows": [], "cols": [], "rev": 0}
         # on=0 表示公开表格（原有逻辑完全不变）；rev 用于多端合并
         self.masked = set()             # 本机只拿到占位值的坐标（真值不在本机）
+        # ---- v9 发布机制：本地表格先建成草稿，点「发布」才对同伴可见 ----
+        self.published = True           # False = 草稿，同伴既看不到也改不了
+        self.publish_key = None         # 同一工作簿（多工作表）共用的发布键
+        self.publish_ts = 0             # 发布时间，UI 用来显示「已于 xx:xx 发布」
 
     # ------------------------------------------------------------ 隐私规则
     def privacy_on(self):
@@ -286,6 +290,7 @@ class Room:
                 "tmpl": self.template_hash, "styled": self.styled,
                 "group": self.group_id or "",
                 "owner": self.owner_id or "",
+                "pub": 1 if self.published else 0,
                 "priv": dict(self.privacy or {})}
 
     def snapshot(self, with_style=False, viewer=None, mask_only=False):
@@ -300,6 +305,7 @@ class Room:
                    "styled": self.styled,
                    "group": self.group_id or "",
                    "owner": self.owner_id or "",
+                   "pub": 1 if self.published else 0,
                    "priv": dict(self.privacy or {})}
             if with_style:
                 out["style"] = self.style
@@ -694,15 +700,31 @@ class Node(CollabMixin):
                     changed["%d,%d" % (r, c)] = room.cells[(r, c)]
         return changed
 
-    def set_privacy(self, room_name, rows=None, cols=None, on=True):
-        """发布者设置隐私区域；rows / cols 是 1-based 的行号 / 列号列表"""
-        room = self.get_room(room_name)
-        if room is None:
-            raise ValueError("协作表格不存在: " + str(room_name))
-        if not self.room_visible_here(room):
-            raise ValueError("你没有这张表格的访问权限")
-        if room.owner_id and room.owner_id != self.id:
-            raise ValueError("只有发布者才能设置隐私区域")
+    @staticmethod
+    def _privacy_nums(value, cols=False):
+        """把界面传来的 'D,E' / '3,5-8' / [4, 5] 统一成 1-based 数字列表"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return priv.parse_cols(value) if cols else priv.parse_rows(value)
+        out = []
+        for x in value:
+            if isinstance(x, str):
+                if cols:
+                    out.extend(priv.parse_cols(x))
+                else:
+                    out.extend(priv.parse_rows(x))
+            else:
+                try:
+                    n = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    out.append(n)
+        return sorted(set(out))
+
+    def _apply_privacy(self, room, on, rows, cols):
+        """只改房间的隐私规则（不广播），返回需要改写的单元格"""
         with room.lock:
             if not room.owner_id:
                 room.owner_id = self.id
@@ -717,9 +739,105 @@ class Node(CollabMixin):
             with room.lock:
                 room.seq += 1
                 room.edit_log.append({"seq": room.seq, "cells": changed})
+        return changed
+
+    def set_privacy(self, room_name, rows=None, cols=None, on=True):
+        """发布者设置隐私区域；rows / cols 是 1-based 的行号 / 列号列表"""
+        room = self.get_room(room_name)
+        if room is None:
+            raise ValueError("协作表格不存在: " + str(room_name))
+        if not self.room_visible_here(room):
+            raise ValueError("你没有这张表格的访问权限")
+        if room.owner_id and room.owner_id != self.id:
+            raise ValueError("只有发布者才能设置隐私区域")
+        self._apply_privacy(room, on, self._privacy_nums(rows),
+                            self._privacy_nums(cols, cols=True))
         self.broadcast_rooms()
         return {"room": room_name, "priv": dict(room.privacy or {}),
-                "owner": room.owner_id or "", "desc": priv.describe(room.privacy)}
+                "owner": room.owner_id or "", "desc": priv.describe(room.privacy),
+                "published": bool(room.published)}
+
+    # ---------------------------------------------------------- v9 发布
+    def _publish_family(self, room):
+        """同一工作簿的各工作表房间一起发布（base 与 base::sheet）"""
+        key = getattr(room, "publish_key", None) or room.name
+        out = [room]
+        with self.rooms_lock:
+            for r in self.rooms.values():
+                if r is room:
+                    continue
+                if (getattr(r, "publish_key", None) or r.name) != key:
+                    continue
+                if (r.owner_id or self.id) != self.id:
+                    continue
+                out.append(r)
+        return out
+
+    def publish_room(self, room_name, priv_on=None, rows=None, cols=None):
+        """把草稿房间发布给同伴：发布后才可见、可编辑。
+
+        priv_on=None 表示不改隐私设置，只发布；True/False 时同时设定隐私规则。
+        """
+        room = self.get_room(room_name)
+        if room is None:
+            raise ValueError("协作表格不存在: " + str(room_name))
+        if room.owner_id and room.owner_id != self.id:
+            raise ValueError("只有发布者才能发布这张表格")
+        with room.lock:
+            if not room.owner_id:
+                room.owner_id = self.id
+        targets = self._publish_family(room)
+        if priv_on is not None:
+            rws = self._privacy_nums(rows)
+            cls_ = self._privacy_nums(cols, cols=True)
+            for r in targets:
+                self._apply_privacy(r, priv_on, rws, cls_)
+        elif room.privacy_on():
+            # 沿用已设好的隐私区域，但把规则同步到同一工作簿的其它工作表
+            for r in targets[1:]:
+                if not r.privacy_on():
+                    self._apply_privacy(r, True, room.privacy.get("rows") or [],
+                                        room.privacy.get("cols") or [])
+        ts = time.time()
+        for r in targets:
+            r.published = True
+            r.publish_ts = ts
+        self.broadcast_rooms()
+        return {"room": room_name, "published": True,
+                "rooms": [r.name for r in targets],
+                "owner": room.owner_id or "",
+                "priv": dict(room.privacy or {}),
+                "desc": priv.describe(room.privacy)}
+
+    def unpublish_room(self, room_name):
+        """把已发布的表格收回成草稿（同伴立即看不到，数据仍在本机）"""
+        room = self.get_room(room_name)
+        if room is None:
+            raise ValueError("协作表格不存在: " + str(room_name))
+        if room.owner_id and room.owner_id != self.id:
+            raise ValueError("只有发布者才能收回这张表格")
+        for r in self._publish_family(room):
+            r.published = False
+        self.broadcast_rooms()
+        return {"room": room_name, "published": False}
+
+    def discard_draft(self, room_name):
+        """放弃草稿：把同一工作簿的草稿房间从本机移除（不影响已发布的）"""
+        room = self.get_room(room_name)
+        if room is None:
+            return {"ok": True, "removed": []}
+        if room.owner_id and room.owner_id != self.id:
+            raise ValueError("只有发布者才能放弃这张表格")
+        removed = []
+        for r in self._publish_family(room):
+            if r.published:
+                continue
+            with self.rooms_lock:
+                if self.rooms.get(r.name) is r:
+                    del self.rooms[r.name]
+            removed.append(r.name)
+        self.broadcast_rooms()
+        return {"ok": True, "removed": removed}
 
     def room_privacy(self, room_name):
         room = self.get_room(room_name)
@@ -730,6 +848,8 @@ class Node(CollabMixin):
                     "priv": dict(room.privacy or {}),
                     "owner": room.owner_id or "",
                     "is_owner": (room.owner_id or self.id) == self.id,
+                    "published": bool(room.published),
+                    "publish_ts": room.publish_ts,
                     "desc": priv.describe(room.privacy)}
 
     # ---------------------------------------------------------- TCP 消息
@@ -1276,12 +1396,14 @@ class Node(CollabMixin):
                 room.source_path = room.file_path
         return style
 
-    def open_xlsx(self, path, room_name=None, gid=None):
+    def open_xlsx(self, path, room_name=None, gid=None, publish=False):
         """打开 Excel：原文件复制为只读样式模板，每个工作表各建一个协作房间。
 
         房间之间只同步「值」；样式、合并、公式、其它工作表、页面设置始终以
         模板为基底，任何一次协作编辑都不会改写它们。
         gid 非空时把整套房间绑定到该群聊：仅群成员可见可编辑。
+        publish=False（默认）时房间先是「草稿」，同伴看不到，等调用
+        publish_room() 才真正共享出去；publish=True 用于群内直接分享等场景。
         """
         path = os.path.abspath(path)
         if not os.path.isfile(path):
@@ -1340,6 +1462,9 @@ class Node(CollabMixin):
                 room.seq += 1
                 room.edit_log.append({"seq": room.seq, "cells": cells})
                 room.owner_id = self.id
+                room.publish_key = base          # 同一工作簿的各表一起发布
+                room.published = bool(publish)   # v9：默认草稿，等用户点发布
+                room.publish_ts = time.time() if publish else 0
                 if g is not None:
                     room.group_id = gid
                     room.group_members = set(g["members"])
@@ -1351,6 +1476,7 @@ class Node(CollabMixin):
         self.broadcast_rooms()
         primary.update({"sheets": sheet_names, "active": active_name,
                         "styled": True, "template": tmpl_hash,
+                        "published": bool(publish),
                         "style": sheetstyle.describe(
                             self.get_room(primary["room"]).style)})
         return primary
@@ -1497,6 +1623,7 @@ class Node(CollabMixin):
                    "styled": bool(room.style),
                    "sheets": list(room.sheets),
                    "owner": room.owner_id or "",
+                   "published": bool(room.published),
                    "priv": dict(room.privacy or {}),
                    "scan": {"scanning": self.scanning, "count": self.scan_count}}
             if room.privacy_on():
@@ -1557,7 +1684,24 @@ class Node(CollabMixin):
                 self.httpd.serve_forever]
         for fn in jobs:
             threading.Thread(target=fn, daemon=True).start()
+        # 预热 openpyxl：首次「打开 Excel / 保存」不必再等 1~8 秒的导入与磁盘扫描
+        threading.Thread(target=self._warm_excel, daemon=True).start()
         return self.httpd
+
+    @staticmethod
+    def _warm_excel():
+        """空闲时把 xlsx 相关模块先导进来（失败也无所谓，真正用到时再导）"""
+        try:
+            time.sleep(3)
+            openpyxl.load_workbook                        # 触发 LazyModule 导入
+            import importlib
+            for m in ("et_xmlfile", "sheetstyle", "styled_sheet"):
+                try:
+                    importlib.import_module(m)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def start(self):
         self.start_services()
@@ -1773,8 +1917,20 @@ class Handler(BaseHTTPRequestHandler):
                                 "cell": body.get("cell")})
                 self._json({"ok": True})
             elif path == "/api/open":
+                pub = body.get("publish", True)
                 self._json({"ok": True, **node.open_xlsx(
-                    body["path"], body.get("room"), gid=body.get("gid") or None)})
+                    body["path"], body.get("room"), gid=body.get("gid") or None,
+                    publish=bool(pub))})
+            elif path == "/api/room/publish":
+                on = body.get("on")
+                self._json({"ok": True, **node.publish_room(
+                    body.get("room", ""), on,
+                    body.get("rows"), body.get("cols"))})
+            elif path == "/api/room/unpublish":
+                self._json({"ok": True, **node.unpublish_room(
+                    body.get("room", ""))})
+            elif path == "/api/room/discard":
+                self._json(node.discard_draft(body.get("room", "")))
             elif path == "/api/save":
                 self._json({"ok": True, "path": node.save_xlsx(body.get("room"), body.get("path"))})
             elif path == "/api/new":

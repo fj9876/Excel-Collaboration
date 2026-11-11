@@ -107,6 +107,7 @@ class LanExcelApp:
         self._member_list_sig = ()
         self._priv_rev = -1          # 隐私设置版本，变化时强制全量重拉
         self._priv_spec = {}
+        self._pub_key = None         # v9 发布状态签名（避免每 tick 重绘发布条）
         self._locked = set()
 
         self.pages = {}
@@ -328,8 +329,31 @@ class LanExcelApp:
                                  cursor="hand2", padx=10)
         self.priv_btn.pack(side="right")
         self.priv_btn.bind("<Button-1>", lambda e: self.show_privacy_dialog())
+        # v9 发布条：本地表格打开后先是草稿，点「发布」才对同伴可见
+        self.pub_bar = tk.Frame(f, bg="#E8F1FF")
+        self.pub_label = tk.Label(self.pub_bar, text="", anchor="w",
+                                  bg="#E8F1FF", fg="#0B4C8C",
+                                  font=(FONT, 9), padx=10, pady=5,
+                                  justify="left")
+        self.pub_label.pack(side="left", fill="x", expand=True)
+        self.pub_kind = tk.Label(self.pub_bar, text="", bg="#E8F1FF", fg="#0067C0",
+                                 font=(FONT, 9, "bold"), cursor="hand2", padx=10)
+        self.pub_kind.pack(side="right")
+        self.pub_kind.bind("<Button-1>", lambda e: self.show_privacy_dialog())
+        self.pub_go = tk.Label(self.pub_bar, text="立即发布", bg="#0067C0",
+                               fg="#FFFFFF", font=(FONT, 9, "bold"),
+                               cursor="hand2", padx=12, pady=3)
+        self.pub_go.pack(side="right", padx=(0, 10))
+        self.pub_go.bind("<Button-1>", lambda e: self.publish_current())
+        self.pub_drop = tk.Label(self.pub_bar, text="放弃", bg="#E8F1FF",
+                                 fg="#8A8F98", font=(FONT, 9),
+                                 cursor="hand2", padx=8)
+        self.pub_drop.pack(side="right")
+        self.pub_drop.bind("<Button-1>", lambda e: self.discard_current())
         ttk.Label(f, textvariable=self.info, style="Muted.TLabel").pack(
             fill="x", pady=(6, 0))
+        self.pub_bar.pack(fill="x", before=self.sheet_host, pady=(0, 6))
+        self.pub_bar.pack_forget()
         self.priv_bar.pack(fill="x", pady=(4, 0))
         self.priv_bar.pack_forget()
         # Excel 式底部工作表标签栏：显示工作簿的全部工作表，点击即切换
@@ -811,7 +835,9 @@ class LanExcelApp:
         self._priv_rev = -1
         self._priv_spec = {}
         self._locked = set()
+        self._pub_key = None
         self.node.my_presence["room"] = name
+        self._update_pub_bar()
         self._update_sheet_choices()
 
     def on_sheet_changed(self, event=None):
@@ -854,6 +880,7 @@ class LanExcelApp:
     def poll_room(self):
         if not self.room:
             return
+        self._update_pub_bar()
         info = self.node.room_style(self.room)
         if info and info.get("version", 0) != self._style_version:
             self._style_version = info.get("version", 0)
@@ -951,9 +978,164 @@ class LanExcelApp:
     def _on_cell_locked(self, event=None):
         self.info.set("🔒 这个单元格是他人填写的隐私内容，已用 *** 遮掩，不能查看或修改")
 
+    # ------------------------------------------------------------ 发布（v9）
+    def _update_pub_bar(self):
+        """草稿状态条：没发布前提醒「同事还看不到」，并给出发布入口"""
+        if not getattr(self, "pub_bar", None):
+            return
+        if not self.room:
+            self._pub_key = None
+            self.pub_bar.pack_forget()
+            return
+        info = self.node.room_privacy(self.room) or {}
+        pub = bool(info.get("published", True))
+        is_owner = bool(info.get("is_owner", True))
+        spec = info.get("priv") or {}
+        key = (self.room, pub, is_owner, bool(spec.get("on")),
+               len(spec.get("rows") or []), len(spec.get("cols") or []))
+        if key == getattr(self, "_pub_key", None):
+            return
+        self._pub_key = key
+        if pub or not is_owner:
+            self.pub_bar.pack_forget()
+            return
+        if spec.get("on"):
+            kind = "隐私表格 · " + privacy.describe(spec)
+            self.pub_kind.configure(text="设置隐私区域")
+        else:
+            kind = "公开表格（所有人可见可编辑）"
+            self.pub_kind.configure(text="改为隐私表格")
+        self.pub_label.configure(
+            text="📝 草稿（未发布）：%s   —   同事现在还看不到这张表格，也不能编辑。" % kind)
+        if not self.pub_bar.winfo_ismapped():
+            self.pub_bar.pack(fill="x", before=self.sheet_host, pady=(0, 6))
+
+    def publish_current(self):
+        """点「发布」：草稿才真正共享给同事；发布后立刻可见可编辑"""
+        if not self.room:
+            self._alert("请先打开或新建一个协作表格")
+            return False
+        info = self.node.room_privacy(self.room) or {}
+        if not info.get("is_owner", True):
+            self._alert("这张表格由他人发布，只有发布者可以发布它")
+            return False
+        if info.get("published"):
+            self._alert("这张表格已经发布过了，同事可以看到并填写")
+            return False
+        spec = info.get("priv") or {}
+        if spec.get("on") and not (spec.get("rows") or spec.get("cols")):
+            messagebox.showwarning(
+                "发布表格",
+                "这是隐私表格，但还没有指定隐私行 / 隐私列。\n"
+                "请先点「设置隐私区域」填好，再点发布。", parent=self.root)
+            return False
+        kind = "隐私表格" if spec.get("on") else "公开表格"
+        detail = privacy.describe(spec)
+        if not messagebox.askyesno(
+                "发布%s" % kind,
+                "把「%s」发布为%s？\n\n%s\n\n发布后，同一内网的同事就能在各自界面里看到"
+                "这张表格，并按上面的规则查看 / 填写。"
+                % (self.room, kind, detail), parent=self.root):
+            return False
+        try:
+            self.node.publish_room(self.room, None)
+        except Exception as e:
+            messagebox.showerror("发布失败", str(e), parent=self.root)
+            return False
+        self._pub_key = None
+        self._rooms_sig = ""
+        self._update_pub_bar()
+        self.info.set("已发布：%s · 同事现在可以看到并填写" % self.room)
+        self._alert("已发布「%s」（%s）\n\n同事的界面里马上就会出现这张表格。"
+                    % (self.room, detail))
+        return True
+
+    def discard_current(self):
+        """放弃未发布的草稿：本机也不再保留（原始 Excel 文件不受影响）"""
+        if not self.room:
+            return
+        info = self.node.room_privacy(self.room) or {}
+        if info.get("published"):
+            self._alert("这张表格已经发布，不能直接放弃；如需收回请用「收回发布」")
+            return
+        if not messagebox.askyesno(
+                "放弃草稿",
+                "放弃「%s」？\n\n这张草稿还没发布，放弃后本机也不再保留它；"
+                "原始 Excel 文件不受任何影响。" % self.room, parent=self.root):
+            return
+        name = self.room
+        try:
+            self.node.discard_draft(name)
+        except Exception as e:
+            messagebox.showerror("放弃失败", str(e), parent=self.root)
+            return
+        self._pub_key = None
+        self._rooms_sig = ""
+        rooms = sorted(self.node.rooms.keys())
+        self.room_cb["values"] = rooms
+        self.room_var.set(rooms[0] if rooms else "")
+        self.room = ""
+        self.pub_bar.pack_forget()
+        if rooms:
+            self.switch_room()
+        else:
+            self.pub_bar.pack_forget()
+        self.info.set("已放弃草稿：%s" % name)
+
+    def ask_table_kind(self, fname):
+        """打开本地表格时先问一句：公开表格还是隐私表格
+
+        返回 "public" / "private" / None（取消）
+        """
+        top = tk.Toplevel(self.root)
+        top.title("打开为协作表格")
+        top.transient(self.root)
+        top.resizable(False, False)
+        top.configure(bg="#FFFFFF")
+        wrap = ttk.Frame(top, padding=18)
+        wrap.pack(fill="both", expand=True)
+        ttk.Label(wrap, text="「%s」" % fname,
+                  font=(FONT, 10, "bold")).pack(anchor="w")
+        ttk.Label(wrap, text="要把这张表格发布成哪种协作表格？\n"
+                            "选好之后点「发布」，同事才可以看到和填写。",
+                  style="Muted.TLabel", justify="left").pack(anchor="w", pady=(4, 10))
+        kind = tk.StringVar(value="public")
+        box = ttk.Frame(wrap)
+        box.pack(fill="x")
+
+        def card(value, title, desc):
+            fr = ttk.Frame(box, padding=(10, 8))
+            fr.pack(fill="x", pady=2)
+            ttk.Radiobutton(fr, text=title, value=value,
+                            variable=kind).pack(anchor="w")
+            ttk.Label(fr, text=desc, style="Muted.TLabel",
+                      justify="left").pack(anchor="w", padx=(22, 0))
+        card("public", "公开表格（原有协作方式）",
+             "所有收到这张表格的同事都能看到全部内容并自由填写。")
+        card("private", "隐私表格",
+             "指定某些行 / 列只有「填写者本人」和「你（发布者）」可见，\n"
+             "其他人看到 *** 且不能修改。设置完再点发布。")
+
+        result = {"v": None}
+        btns = ttk.Frame(wrap)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def ok():
+            result["v"] = kind.get()
+            top.destroy()
+        make_button(btns, "确定", ok, True).pack(side="right")
+        make_button(btns, "取消", top.destroy).pack(side="right", padx=6)
+        top.grab_set()
+        self.root.wait_window(top)
+        return result["v"]
+
     # ------------------------------------------------------------ 隐私表格
-    def show_privacy_dialog(self, initial=None):
-        """发布者设置哪些行 / 列属于隐私区域"""
+    def show_privacy_dialog(self, initial=None, publish_after=False):
+        """发布者设置哪些行 / 列属于隐私区域
+
+        publish_after=True 时用于「打开表格 → 选隐私表格」流程：
+        设置好隐私区域后直接发布，一步到位。
+        """
         if not self.room:
             self._alert("请先打开或新建一个协作表格")
             return
@@ -969,14 +1151,19 @@ class LanExcelApp:
                 parent=self.root)
             return
 
+        draft = not bool(info.get("published", True))
         top = tk.Toplevel(self.root)
-        top.title("隐私表格设置")
+        top.title("设置隐私区域并发布" if publish_after else "隐私表格设置")
         top.transient(self.root)
         top.resizable(False, False)
         top.configure(bg="#FFFFFF")
         wrap = ttk.Frame(top, padding=16)
         wrap.pack(fill="both", expand=True)
 
+        if publish_after and draft:
+            ttk.Label(wrap, text="第 2 步 / 共 2 步：指定隐私行 / 列，然后点「保存并发布」",
+                      font=(FONT, 9, "bold"), foreground="#0B4C8C").pack(
+                anchor="w", pady=(0, 6))
         ttk.Label(wrap, text="隐私表格：指定的行 / 列只有「填写者本人」和「发布者」可见，\n"
                             "其他人看到的是 *** ，也改不了别人的内容。",
                   justify="left").pack(anchor="w")
@@ -1036,8 +1223,10 @@ class LanExcelApp:
         on_var.trace_add("write", refresh_preview)
         refresh_preview()
 
-        tip = ttk.Label(wrap, text="提示：建议在发布表格时就设置好隐私区域；\n"
-                                   "已经公开同步出去的内容无法收回。",
+        tip = ttk.Label(wrap, text=("提示：点「保存并发布」后，同事才会看到这张表格；\n"
+                                    "发布前它只是本机的草稿。") if publish_after else
+                        ("提示：建议在发布表格时就设置好隐私区域；\n"
+                         "已经公开同步出去的内容无法收回。"),
                         style="Muted.TLabel", justify="left")
         tip.pack(anchor="w", pady=(8, 0))
 
@@ -1052,19 +1241,32 @@ class LanExcelApp:
                                        parent=top)
                 return
             try:
-                self.node.set_privacy(self.room, rows=rows, cols=cols,
-                                      on=on_var.get())
+                if publish_after:
+                    # 设置 + 发布一步完成：发布后同事立刻可见
+                    self.node.publish_room(self.room, on_var.get(), rows, cols)
+                else:
+                    self.node.set_privacy(self.room, rows=rows, cols=cols,
+                                          on=on_var.get())
             except Exception as e:
                 messagebox.showerror("设置失败", str(e), parent=top)
                 return
             top.destroy()
             self._priv_rev = -1
+            self._pub_key = None
             self.since = 0
             self.poll_room()
-            self._alert("已保存隐私设置：\n" + privacy.describe(
-                {"on": 1, "rows": rows, "cols": cols} if on_var.get() else None))
+            self._update_pub_bar()
+            desc = privacy.describe(
+                {"on": 1, "rows": rows, "cols": cols} if on_var.get() else None)
+            if publish_after:
+                self.info.set("已发布：%s · %s" % (self.room, desc))
+                self._alert("已发布「%s」\n%s\n\n同事现在可以看到这张表格了。"
+                            % (self.room, desc))
+            else:
+                self._alert("已保存隐私设置：\n" + desc)
 
-        make_button(btns, "保存", apply, True).pack(side="right")
+        make_button(btns, "保存并发布" if publish_after else "保存", apply,
+                    True).pack(side="right")
         make_button(btns, "取消", top.destroy).pack(side="right", padx=6)
         top.grab_set()
         return top
@@ -2304,28 +2506,32 @@ class LanExcelApp:
             filetypes=[("Excel 文件", "*.xlsx"), ("所有文件", "*.*")])
         if not path:
             return
+        # v9：先确认这张表格要发布成公开表格还是隐私表格
+        kind = self.ask_table_kind(os.path.basename(path))
+        if not kind:
+            return
         try:
-            info = self.node.open_xlsx(path)
+            info = self.node.open_xlsx(path)      # 先建成草稿，未发布
             self._rooms_sig = ""
             self.room_var.set(info["room"])
             self.switch_room()
-            self._alert(
-                "已共享: %s\n房间: %s · 读取 %d 个单元格\n"
-                "工作表: %s\n原有样式: %s\n\n"
-                "样式（字体/合并/边框/列宽行高/公式/其它工作表）以原文件为模板完整保留，"
-                "协作只同步单元格的值。"
-                % (os.path.basename(path), info["room"], len(info["cells"]),
-                   " / ".join(info.get("sheets", [])),
-                   info.get("style", "")))
-            if messagebox.askyesno(
-                    "隐私表格",
-                    "要把这张表格发布为隐私表格吗？\n\n"
-                    "隐私表格可以指定某些行/列只有「填写者本人」和「你（发布者）」"
-                    "能看到，其他人看到 *** 且无法修改。\n\n"
-                    "选「否」= 普通公开协作表格（原有方式）。",
-                    parent=self.root):
+            self._pub_key = None
+            self._update_pub_bar()
+            if kind == "private":
+                # 隐私表格：先把行列设置好，再在对话框里直接发布
                 self._priv_rev = -1
-                self.show_privacy_dialog()
+                self.show_privacy_dialog(publish_after=True)
+            else:
+                self._alert(
+                    "已作为公开表格打开: %s\n房间: %s · 读取 %d 个单元格\n"
+                    "工作表: %s\n原有样式: %s\n\n"
+                    "样式（字体/合并/边框/列宽行高/公式/其它工作表）以原文件为模板完整保留，"
+                    "协作只同步单元格的值。\n\n"
+                    "现在还是草稿：点「立即发布」后同事才看得到、才能填。"
+                    % (os.path.basename(path), info["room"], len(info["cells"]),
+                       " / ".join(info.get("sheets", [])),
+                       info.get("style", "")))
+                self.publish_current()
         except Exception as e:
             messagebox.showerror("打开失败", str(e))
 

@@ -81,6 +81,11 @@
   #privbar{display:flex; align-items:center; gap:8px; margin:0 14px;
            padding:6px 10px; background:#FFF8E1; border:1px solid #F0DFA8;
            border-radius:6px; color:#8A6100; font-size:12px;}
+  #pubbar{display:none; align-items:center; gap:8px; margin:0 14px;
+          padding:6px 10px; background:#E8F1FF; border:1px solid #B9D3F2;
+          border-radius:6px; color:#0B4C8C; font-size:12px;}
+  #pubbar button{background:#0067C0; border-color:#0067C0; color:#fff; padding:3px 12px;}
+  #pubbar button.ghost{background:#fff; color:#8A8F98; border-color:#D9DEE5;}
   td.masked{background:#F1F3F6 !important; color:#9AA0A8 !important;
             font-style:italic; text-align:center; cursor:not-allowed;}
   td.masked.sel{outline:2px solid #C9CFD8;}
@@ -160,6 +165,14 @@
     <span class="chip" id="peerchip" title="已发现的内网节点">节点 0</span>
     <span class="chip" id="roomchip">未加入房间</span>
     <button class="primary" onclick="toggleChat()">群聊 / 文件</button>
+  </div>
+
+  <div id="pubbar">
+    <span id="pubtext">📝 草稿（未发布）</span>
+    <span style="flex:1"></span>
+    <button id="pubpriv" onclick="openPrivacy()">设置隐私区域</button>
+    <button onclick="publishRoom()">发布</button>
+    <button class="ghost" onclick="discardDraft()">放弃</button>
   </div>
 
   <div id="privbar" style="display:none">
@@ -310,6 +323,11 @@ function poll(){
       // 样式模板可能稍后才从同伴同步过来，版本变化时强制下一轮全量拉取
       if(d.style_version !== undefined && d.style_version !== styleVersion){
         styleVersion = d.style_version; since = 0;
+      }
+      const npub = d.published !== false;
+      if(npub !== pubPublished || (d.owner||"") !== pubOwner){
+        pubPublished = npub; pubOwner = d.owner || "";
+        updatePubBar();
       }
       const prev = d.priv || {};
       const nrev = Number(prev.rev || 0);
@@ -589,7 +607,9 @@ document.addEventListener("keydown", e=>{
 $("roomsel").addEventListener("change", ()=>{
   room = $("roomsel").value; since = 0; cells = {}; sel = null;
   styleInfo = null; styleVersion = -1; sheetNames = [];
-  privRev = -1; privSpec = null; privOwner = ""; updatePrivBar();
+  privRev = -1; privSpec = null; privOwner = "";
+  pubPublished = true; pubOwner = ""; updatePubBar();
+  updatePrivBar();
   refreshRooms([...$("roomsel").options].map(o=>o.value).filter(v=>v));
   if(room) toast("已切换到房间: "+room);
 });
@@ -608,12 +628,67 @@ function newRoom(){
 function openXlsx(){
   const path = prompt("输入本机 Excel 文件完整路径:", "I:\\excel\\协作表.xlsx");
   if(!path) return;
-  post("/api/open",{path}).then(res=>{
+  const priv = confirm("「" + path + "」\n\n要把这张表格发布成哪种协作表格？\n\n"
+    + "确定 = 隐私表格（指定行/列只有填写者本人与发布者可见，设置完再发布）\n"
+    + "取消 = 公开表格（所有人可见可编辑，点「发布」后生效）");
+  post("/api/open",{path, publish:false}).then(res=>{
     if(!res.ok){ toast("打开失败: "+res.error); return; }
     room = res.room; since = 0; cells = {};
     styleInfo = null; styleVersion = -1; sheetNames = res.sheets || [];
     refreshRooms([room]);
-    toast(`已共享: ${path}（房间: ${room}）· 原有样式完整保留：${res.style||""}`);
+    privRev = -1; privSpec = null; privOwner = "";
+    pubPublished = false; pubOwner = ""; pubKind = priv ? "private" : "public";
+    updatePrivBar(); updatePubBar();
+    if(priv){ openPrivacy(true); return; }
+    toast(`已作为公开表格打开（草稿）：房间 ${room}。点顶部「发布」后同事才看得到`);
+    publishRoom();
+  });
+}
+/* ---------------- 发布（v9） ---------------- */
+let pubPublished = true, pubOwner = "", pubKind = "public";
+function updatePubBar(){
+  const bar = $("pubbar");
+  if(!bar) return;
+  const meId = (me && me.id) || "";
+  const isOwner = !pubOwner || !meId || pubOwner === meId;
+  if(pubPublished || !isOwner || !room){ bar.style.display = "none"; return; }
+  const spec = privSpec || {};
+  const kind = spec.on ? ("隐私表格 · " + describePriv(spec))
+                       : "公开表格（所有人可见可编辑）";
+  $("pubtext").textContent = "📝 草稿（未发布）：" + kind
+    + " — 同事现在还看不到这张表格，也不能编辑";
+  $("pubpriv").textContent = spec.on ? "修改隐私区域" : "改为隐私表格";
+  bar.style.display = "flex";
+}
+function publishRoom(){
+  if(!room){ toast("请先打开一个表格"); return; }
+  const spec = privSpec || {};
+  if(spec.on && !((spec.cols||[]).length || (spec.rows||[]).length)){
+    toast("隐私表格还没指定隐私行/列，请先设置隐私区域");
+    return;
+  }
+  const kind = spec.on ? "隐私表格" : "公开表格";
+  if(!confirm(`把「${room}」发布为${kind}？\n\n${describePriv(spec)}\n\n发布后同一内网的同事就能看到并填写。`))
+    return;
+  post("/api/room/publish",{room}).then(res=>{
+    if(!res.ok){ toast("发布失败: "+(res.error||"")); return; }
+    pubPublished = true; pubOwner = res.owner || pubOwner;
+    updatePubBar();
+    toast("已发布：" + room + "（" + (res.desc||"") + "）");
+  });
+}
+function discardDraft(){
+  if(!room) return;
+  if(pubPublished){ toast("已经发布的表格不能放弃；如需收回请用「收回发布」"); return; }
+  if(!confirm(`放弃草稿「${room}」？\n\n本机也不再保留它，原始 Excel 文件不受影响。`))
+    return;
+  post("/api/room/discard",{room}).then(res=>{
+    if(!res.ok){ toast("放弃失败: "+(res.error||"")); return; }
+    room = ""; since = 0; cells = {}; pubPublished = true;
+    $("roomsel").value = "";
+    refreshRooms([...$("roomsel").options].map(o=>o.value).filter(v=>v));
+    updatePrivBar(); updatePubBar();
+    toast("已放弃草稿");
   });
 }
 function saveXlsx(saveAs){
@@ -674,19 +749,21 @@ function updatePrivBar(){
   btn.textContent = isOwner ? "修改隐私区域" : "只有发布者可设置";
   btn.disabled = !isOwner;
 }
-function openPrivacy(){
+function openPrivacy(publishAfter){
   if(!room){ toast("请先加入房间"); return; }
   const cur = privSpec || {};
-  const on = confirm("把这张表格设为隐私表格？\n\n"
-    + "指定行/列后：只有「填写者本人」和「发布者」能看到内容，\n"
-    + "其他人看到 *** ，也改不了别人的内容。\n\n"
-    + "确定 = 隐私表格，取消 = 改为公开表格（原有方式）");
-  if(!on){
-    post("/api/room/privacy",{room,on:false}).then(res=>{
-      if(!res.ok){ toast("设置失败: "+res.error); return; }
-      privRev = -1; since = 0; toast("已改为公开表格");
-    });
-    return;
+  if(!publishAfter){
+    const on = confirm("把这张表格设为隐私表格？\n\n"
+      + "指定行/列后：只有「填写者本人」和「发布者」能看到内容，\n"
+      + "其他人看到 *** ，也改不了别人的内容。\n\n"
+      + "确定 = 隐私表格，取消 = 改为公开表格（原有方式）");
+    if(!on){
+      post("/api/room/privacy",{room,on:false}).then(res=>{
+        if(!res.ok){ toast("设置失败: "+res.error); return; }
+        privRev = -1; since = 0; updatePubBar(); toast("已改为公开表格");
+      });
+      return;
+    }
   }
   const cols = prompt("隐私列（表头字母或列号，如 D,E 或 4-6；留空表示不按列）",
                       compressCols(cur.cols||[]));
@@ -694,9 +771,20 @@ function openPrivacy(){
   const rows = prompt("隐私行（行号，如 3,5-8；留空表示不按行）",
                       compressNums(cur.rows||[]));
   if(rows === null) return;
+  if(publishAfter){
+    post("/api/room/publish",{room,on:true,cols,rows}).then(res=>{
+      if(!res.ok){ toast("发布失败: "+(res.error||"")); return; }
+      privRev = -1; since = 0; pubPublished = true;
+      pubOwner = res.owner || "";
+      updatePrivBar(); updatePubBar();
+      toast("已发布隐私表格：" + (res.desc||""));
+    });
+    return;
+  }
   post("/api/room/privacy",{room,on:true,cols:cols,rows:rows}).then(res=>{
     if(!res.ok){ toast("设置失败: "+res.error); return; }
     privRev = -1; since = 0;
+    updatePubBar();
     toast("已保存隐私设置：" + (res.desc||""));
   });
 }

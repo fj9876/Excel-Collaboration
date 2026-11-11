@@ -57,6 +57,7 @@ except ImportError:
     print("缺少依赖 openpyxl，请先执行: pip install openpyxl")
     sys.exit(1)
 
+import privacy as priv                                  # noqa: E402
 from collab import CollabMixin, FILE_PORT_BASE, human_size  # noqa: E402
 from avatars import avatar_b64, default_avatar               # noqa: E402
 import sheetstyle                                          # noqa: E402
@@ -222,16 +223,58 @@ class Room:
         # ---- v5 群内表格隔离：绑定群后只有群成员可见可编辑 ----
         self.group_id = None            # 所属群；None = 公开房间（原有协作方式）
         self.group_members = set()      # 成员快照，群资料未到时也能判定
-        self.owner_id = None            # 共享者
+        self.owner_id = None            # 发布者（共享这个表格的人）
+        # ---- v8 隐私表格：指定行/列的内容只有填写者本人与发布者可见 ----
+        self.privacy = {"on": 0, "rows": [], "cols": [], "rev": 0}
+        # on=0 表示公开表格（原有逻辑完全不变）；rev 用于多端合并
+        self.masked = set()             # 本机只拿到占位值的坐标（真值不在本机）
+
+    # ------------------------------------------------------------ 隐私规则
+    def privacy_on(self):
+        return priv.is_on(self.privacy)
+
+    def cell_private(self, r, c):
+        return priv.is_private(self.privacy, r, c)
+
+    def cell_hidden(self, r, c, viewer):
+        """该单元格对 viewer 是否显示为星号（读不到真实内容）"""
+        if viewer == self.owner_id:
+            return False                      # 发布者看全部
+        if not self.cell_private(r, c):
+            return False                      # 非隐私区域，原有逻辑
+        cell = self.cells.get((r, c))
+        if cell is None:
+            return False                      # 空格子没有可遮掩的内容
+        if cell[2] == viewer:
+            return False                      # 自己填的，自己看得见
+        return bool(cell[0]) or (r, c) in self.masked
+
+    def cell_editable(self, r, c, pid):
+        """谁可以写这个单元格：隐私区只有本人（或发布者）能写，防止覆盖他人"""
+        if not self.cell_private(r, c):
+            return True
+        if pid and pid == self.owner_id:
+            return True
+        cell = self.cells.get((r, c))
+        return cell is None or cell[2] == pid
 
     def digest(self):
         with self.lock:
             if not self.cells:
                 return (0, "")
-            raw = "\n".join(
-                f"{r},{c}:{repr(v)}:{ts}:{who}"
-                for (r, c), (v, ts, who) in sorted(self.cells.items())
-            )
+            if self.privacy_on():
+                # 隐私表格的摘要不能包含值：各端对同一格持有的内容不同
+                #（有的只有占位），只比 坐标+时间戳+填写者 才能一致收敛
+                raw = "\n".join(
+                    f"{r},{c}:{ts}:{who}"
+                    for (r, c), (v, ts, who) in sorted(self.cells.items())
+                )
+                raw += "|p%d" % int((self.privacy or {}).get("rev", 0))
+            else:
+                raw = "\n".join(
+                    f"{r},{c}:{repr(v)}:{ts}:{who}"
+                    for (r, c), (v, ts, who) in sorted(self.cells.items())
+                )
             return (len(self.cells), hashlib.md5(raw.encode("utf-8")).hexdigest())
 
     def rooms_map(self):
@@ -241,22 +284,58 @@ class Room:
                 "rows": self.rows, "cols": self.cols,
                 "count": count, "hash": h,
                 "tmpl": self.template_hash, "styled": self.styled,
-                "group": self.group_id or ""}
+                "group": self.group_id or "",
+                "owner": self.owner_id or "",
+                "priv": dict(self.privacy or {})}
 
-    def snapshot(self, with_style=False):
+    def snapshot(self, with_style=False, viewer=None, mask_only=False):
+        """viewer 非空时按他的身份裁剪隐私单元格（返回占位，不含真值）"""
         with self.lock:
             out = {"name": self.name, "sheet": self.sheet_name,
                    "sheets": list(self.sheets),
                    "rows": self.rows, "cols": self.cols,
-                   "cells": {f"{r},{c}": [v, ts, who]
-                             for (r, c), (v, ts, who) in self.cells.items()},
+                   "cells": self.cells_view(viewer, mask_only=mask_only),
                    "tmpl": self.template_hash,
                    "style_version": self.style_version,
                    "styled": self.styled,
-                   "group": self.group_id or ""}
+                   "group": self.group_id or "",
+                   "owner": self.owner_id or "",
+                   "priv": dict(self.privacy or {})}
             if with_style:
                 out["style"] = self.style
             return out
+
+    def cells_view(self, viewer, keys=None, mask_only=False):
+        """把单元格字典转成查看者视角。
+
+        mask_only=True 时只返回「需要打码」的 key 列表（用于增量编辑）。
+        隐私单元格统一换成 ["", ts, who, 1]，第 4 位是遮掩标记。
+        """
+        out = {}
+        with self.lock:
+            items = self.cells.items() if keys is None else \
+                [(self._key_rc(k), self.cells.get(self._key_rc(k)))
+                 for k in keys]
+            for (r, c), cell in items:
+                if cell is None:
+                    continue
+                k = "%d,%d" % (r, c)
+                if self.cell_hidden(r, c, viewer):
+                    if not mask_only:
+                        out[k] = ["", cell[1], cell[2], 1]
+                elif not mask_only:
+                    out[k] = [cell[0], cell[1], cell[2]]
+        return out
+
+    @staticmethod
+    def _key_rc(key):
+        if isinstance(key, tuple):
+            return key
+        try:
+            r, c = str(key).split(",")
+            return int(r), int(c)
+        except ValueError:
+            return (0, 0)
 
 
 class PeerConn:
@@ -468,6 +547,16 @@ class Node(CollabMixin):
                 return r
             return None
 
+    @staticmethod
+    def _cell_parts(cell):
+        """兼容 3 元 / 4 元单元格：[值, 时间戳, 填写者, 遮掩标记?]"""
+        try:
+            v, ts, who = cell[0], cell[1], cell[2]
+        except (TypeError, IndexError):
+            return "", 0, "", False
+        hidden = len(cell) > 3 and bool(cell[3])
+        return v, ts, who, hidden
+
     def apply_edit(self, room_name, cells, seen=None, local=False, from_peer=None):
         room = self.get_room(room_name)
         if room is None:
@@ -480,21 +569,34 @@ class Node(CollabMixin):
                 raise ValueError("该协作表格仅群成员可编辑，你不在该群聊中")
         elif from_peer and not self.room_visible_to(room, from_peer):
             return
+        writer = self.id if local else from_peer
         changed = {}
+        blocked = []
         with room.lock:
-            for key, (v, ts, who) in cells.items():
+            for key, cell in cells.items():
+                v, ts, who, hidden = self._cell_parts(cell)
                 try:
                     r, c = key.split(",")
                     r, c = int(r), int(c)
-                except ValueError:
+                except (AttributeError, ValueError):
+                    continue
+                # 隐私区：别人的格子不许覆盖（前端已锁，这里兜住越权请求）
+                if not room.cell_editable(r, c, who if not local else self.id):
+                    blocked.append(key)
                     continue
                 cur = room.cells.get((r, c))
-                if cur is None or (ts, who) > (cur[1], cur[2]):
-                    room.cells[(r, c)] = [v, ts, who]
+                placeholder = (r, c) in room.masked and not hidden
+                if cur is None or placeholder or (ts, who) > (cur[1], cur[2]):
+                    if hidden:
+                        room.cells[(r, c)] = ["", ts, who]
+                        room.masked.add((r, c))
+                    else:
+                        room.cells[(r, c)] = [v, ts, who]
+                        room.masked.discard((r, c))
                     room.edited.add((r, c))
                     room.rows = max(room.rows, r + 1)
                     room.cols = max(room.cols, c + 1)
-                    changed[key] = [v, ts, who]
+                    changed[key] = room.cells[(r, c)]
         if changed:
             room.dirty = True
             with room.lock:
@@ -503,14 +605,18 @@ class Node(CollabMixin):
                 if len(room.edit_log) > 3000:
                     room.edit_log = room.edit_log[-3000:]
             if local:
-                self.broadcast({"t": "edit", "room": room_name,
-                                "cells": changed, "seen": [self.id]})
+                self.broadcast_edit(room_name, changed)
             else:
                 self.forward(room_name, changed, seen or [])
+        if blocked and local:
+            raise ValueError("有 %d 个隐私单元格已被他人填写，不能覆盖" % len(blocked))
+        return blocked
 
-    def merge_room(self, meta, cells):
+    def merge_room(self, meta, cells, mask=()):
         room = self.get_room(meta["name"], create=True)
+        mask = set(mask or ())
         changed = {}
+        force_real = False          # 隐私刚好关闭：占位格必须接收真值
         with room.lock:
             if not room.cells and not room.file_path:
                 room.sheet_name = meta.get("sheet", room.sheet_name)
@@ -520,6 +626,20 @@ class Node(CollabMixin):
                 room.sheets = list(meta["sheets"])
             if meta.get("group"):
                 room.group_id = meta["group"]
+            if meta.get("owner") and not room.owner_id:
+                room.owner_id = meta["owner"]
+            # 隐私设置：以 rev 大的为准，避免旧广播把新设置顶回去
+            p = priv.norm(meta.get("priv"))
+            if p is not None:
+                cur = room.privacy or {}
+                if p["rev"] >= int(cur.get("rev", 0)):
+                    was_on = bool(cur.get("on"))
+                    room.privacy = p
+                    if was_on and not p["on"]:
+                        # 隐私关闭：本地占位要全部换成同伴发来的真值
+                        for _rc in list(room.masked):
+                            room.masked.discard(_rc)
+                        force_real = True
             if meta.get("tmpl"):
                 room.template_hash = meta["tmpl"]
             if meta.get("style"):
@@ -528,22 +648,89 @@ class Node(CollabMixin):
                 room.style_version += 1
                 room.rows = max(room.rows, meta["style"].get("rows", 0) + 2)
                 room.cols = max(room.cols, meta["style"].get("cols", 0) + 2)
-            for key, (v, ts, who) in cells.items():
-                r, c = key.split(",")
-                r, c = int(r), int(c)
+            for key, cell in cells.items():
+                v, ts, who, hidden = self._cell_parts(cell)
+                try:
+                    r, c = key.split(",")
+                    r, c = int(r), int(c)
+                except (AttributeError, ValueError):
+                    continue
+                hidden = hidden or key in mask
                 cur = room.cells.get((r, c))
-                if cur is None or (ts, who) > (cur[1], cur[2]):
-                    room.cells[(r, c)] = [v, ts, who]
+                # 本地只是占位（真值在别人机器上）时，任何一份真值都该收下
+                placeholder = ((r, c) in room.masked or force_real) and not hidden
+                if cur is None or placeholder or (ts, who) > (cur[1], cur[2]):
+                    if hidden:
+                        room.cells[(r, c)] = ["", ts, who]
+                        room.masked.add((r, c))
+                    else:
+                        room.cells[(r, c)] = [v, ts, who]
+                        room.masked.discard((r, c))
                     room.edited.add((r, c))
                     room.rows = max(room.rows, r + 1)
                     room.cols = max(room.cols, c + 1)
-                    changed[key] = [v, ts, who]
+                    changed[key] = room.cells[(r, c)]
+            # 隐私刚生效时，把本机不该看见的真值清成占位：数据只在本人与发布者机器上
+            changed.update(self._scrub_private(room))
             if changed:
                 room.dirty = True
         if changed:
             with room.lock:
                 room.seq += 1
                 room.edit_log.append({"seq": room.seq, "cells": changed})
+
+    def _scrub_private(self, room):
+        """把本机不该看见的隐私真值清成占位（隐私开启时调用）"""
+        changed = {}
+        if not room.privacy_on():
+            return changed
+        with room.lock:
+            for (r, c), cell in list(room.cells.items()):
+                if (r, c) in room.masked or not cell[0]:
+                    continue
+                if room.cell_hidden(r, c, self.id):
+                    room.cells[(r, c)] = ["", cell[1], cell[2]]
+                    room.masked.add((r, c))
+                    changed["%d,%d" % (r, c)] = room.cells[(r, c)]
+        return changed
+
+    def set_privacy(self, room_name, rows=None, cols=None, on=True):
+        """发布者设置隐私区域；rows / cols 是 1-based 的行号 / 列号列表"""
+        room = self.get_room(room_name)
+        if room is None:
+            raise ValueError("协作表格不存在: " + str(room_name))
+        if not self.room_visible_here(room):
+            raise ValueError("你没有这张表格的访问权限")
+        if room.owner_id and room.owner_id != self.id:
+            raise ValueError("只有发布者才能设置隐私区域")
+        with room.lock:
+            if not room.owner_id:
+                room.owner_id = self.id
+            rev = int((room.privacy or {}).get("rev", 0)) + 1
+            p = priv.norm({"on": 1 if on else 0, "rows": rows or [],
+                           "cols": cols or [], "rev": rev})
+            room.privacy = p
+            if not p["on"]:
+                room.masked.clear()
+        changed = self._scrub_private(room)
+        if changed:
+            with room.lock:
+                room.seq += 1
+                room.edit_log.append({"seq": room.seq, "cells": changed})
+        self.broadcast_rooms()
+        return {"room": room_name, "priv": dict(room.privacy or {}),
+                "owner": room.owner_id or "", "desc": priv.describe(room.privacy)}
+
+    def room_privacy(self, room_name):
+        room = self.get_room(room_name)
+        if room is None:
+            return {}
+        with room.lock:
+            return {"room": room_name,
+                    "priv": dict(room.privacy or {}),
+                    "owner": room.owner_id or "",
+                    "is_owner": (room.owner_id or self.id) == self.id,
+                    "desc": priv.describe(room.privacy)}
 
     # ---------------------------------------------------------- TCP 消息
     def _rooms_msg_for(self, pid):
@@ -571,6 +758,20 @@ class Node(CollabMixin):
             if conn.peer_id and conn.peer_id not in exclude_ids:
                 conn.send(obj)
 
+    def broadcast_edit(self, room_name, cells):
+        """把本地编辑发给同伴：隐私表格按收件人身份逐条裁剪"""
+        room = self.get_room(room_name)
+        for conn in list(self.conns):
+            if not conn.peer_id:
+                continue
+            if room is not None and not self.room_visible_to(room, conn.peer_id):
+                continue
+            msg = {"t": "edit", "room": room_name, "cells": cells,
+                   "seen": [self.id]}
+            if room is not None and room.privacy_on():
+                msg["cells"] = room.cells_view(conn.peer_id, keys=list(cells))
+            conn.send(msg)
+
     def forward(self, room, cells, seen):
         seen = set(seen) | {self.id}
         r = self.get_room(room)
@@ -578,7 +779,10 @@ class Node(CollabMixin):
             if conn.peer_id and conn.peer_id not in seen:
                 if r is not None and not self.room_visible_to(r, conn.peer_id):
                     continue          # 群内房间不转发给非成员
-                conn.send({"t": "edit", "room": room, "cells": cells,
+                payload = cells
+                if r is not None and r.privacy_on():
+                    payload = r.cells_view(conn.peer_id, keys=list(cells))
+                conn.send({"t": "edit", "room": room, "cells": payload,
                            "seen": sorted(seen)})
 
     def handle_msg(self, conn, msg):
@@ -638,7 +842,7 @@ class Node(CollabMixin):
             if not self.room_visible_to(room, conn.peer_id):
                 conn.send({"t": "state_denied", "room": room.name})
                 return
-            snap = room.snapshot(with_style=False)
+            snap = room.snapshot(with_style=False, viewer=conn.peer_id)
             snap["t"] = "state"
             snap["http"] = self.http_port
             conn.send(snap)
@@ -1135,10 +1339,10 @@ class Node(CollabMixin):
                 room.dirty = False
                 room.seq += 1
                 room.edit_log.append({"seq": room.seq, "cells": cells})
+                room.owner_id = self.id
                 if g is not None:
                     room.group_id = gid
                     room.group_members = set(g["members"])
-                    room.owner_id = self.id
             if sn == active_name:
                 primary = {"room": rn, "cells": cells, "sheet": sn,
                            "rows": room.rows, "cols": room.cols}
@@ -1252,7 +1456,7 @@ class Node(CollabMixin):
 
     def public_state(self):
         with self.rooms_lock:
-            rooms = [r.snapshot() for r in self.rooms.values()
+            rooms = [r.snapshot(viewer=self.id) for r in self.rooms.values()
                      if self.room_visible_here(r)]
         return {"me": {"id": self.id, "name": self.name, "note": self.note,
                        "color": self.color, "avatar": self.avatar,
@@ -1292,18 +1496,38 @@ class Node(CollabMixin):
                    "style_version": room.style_version,
                    "styled": bool(room.style),
                    "sheets": list(room.sheets),
+                   "owner": room.owner_id or "",
+                   "priv": dict(room.privacy or {}),
                    "scan": {"scanning": self.scanning, "count": self.scan_count}}
+            if room.privacy_on():
+                out["edits"] = [{"seq": e["seq"],
+                                 "cells": self._view_payload(room, e["cells"],
+                                                             self.id)}
+                                for e in edits]
             if full:
-                out["cells"] = {f"{r},{c}": [v, ts, who]
-                                for (r, c), (v, ts, who) in room.cells.items()}
+                out["cells"] = room.cells_view(self.id)
                 out["meta"] = {"sheet": room.sheet_name, "rows": room.rows,
                                "cols": room.cols,
                                "file": room.file_path or "",
                                "sheets": list(room.sheets),
                                "style_version": room.style_version,
                                "template": room.template_hash,
-                               "styled": bool(room.style)}
+                               "styled": bool(room.style),
+                               "owner": room.owner_id or "",
+                               "priv": dict(room.privacy or {})}
                 out["style"] = room.style
+        return out
+
+    def _view_payload(self, room, cells, viewer):
+        """把一份编辑负载转成 viewer 视角（隐私格换成占位）"""
+        out = {}
+        for key, cell in cells.items():
+            v, ts, who, hidden = self._cell_parts(cell)
+            r, c = room._key_rc(key)
+            if not hidden and viewer != room.owner_id and room.cell_private(r, c) \
+                    and who != viewer and (bool(v) or (r, c) in room.masked):
+                hidden = True
+            out[key] = ["", ts, who, 1] if hidden else [v, ts, who]
         return out
 
     # ---------------------------------------------------------- 启动 / 关闭
@@ -1470,6 +1694,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
         elif path == "/api/room/style":
             self._json(node.room_style(self._query().get("room", "")) or {})
+        elif path == "/api/room/privacy":
+            self._json(node.room_privacy(self._query().get("room", "")))
         elif path == "/api/state":
             self._json(node.public_state())
         elif path == "/api/poll":
@@ -1552,7 +1778,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/save":
                 self._json({"ok": True, "path": node.save_xlsx(body.get("room"), body.get("path"))})
             elif path == "/api/new":
-                self._json({"ok": True, "room": node.get_room(body.get("room", ""), create=True).name})
+                room = node.get_room(body.get("room", ""), create=True)
+                if not room.owner_id:
+                    room.owner_id = node.id       # 本机建的房间，我就是发布者
+                self._json({"ok": True, "room": room.name})
             elif path == "/api/config":
                 self._json({"ok": True, "config": node.update_config(body)})
             elif path == "/api/scan":
@@ -1621,6 +1850,14 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("未知的消息类型: " + str(kind))
                 self._json({"ok": True})
+            elif path == "/api/room/privacy":
+                self._json({"ok": True, **node.set_privacy(
+                    body.get("room", ""),
+                    rows=priv.parse_rows(body.get("rows", ""))
+                    if isinstance(body.get("rows"), str) else body.get("rows") or [],
+                    cols=priv.parse_cols(body.get("cols", ""))
+                    if isinstance(body.get("cols"), str) else body.get("cols") or [],
+                    on=bool(body.get("on", True)))})
             elif path == "/api/file/send":
                 self._json({"ok": True, **node.send_file(
                     body.get("path", ""), to=body.get("to"),

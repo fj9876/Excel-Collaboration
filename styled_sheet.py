@@ -22,6 +22,8 @@ GRID_LINE = "#D7DEE8"
 HEAD_BG = "#F3F6FA"
 HEAD_FG = "#5A6472"
 ACCENT = "#0067C0"
+MASK_BG = "#F1F3F6"     # 隐私遮罩格背景
+MASK_FG = "#9AA0A8"     # 隐私遮罩格文字（***）
 
 
 def col_name(c):
@@ -46,6 +48,7 @@ class StyledSheet(ttk.Frame):
         self._col_w = [column_width] * self.columns
         self._row_h = [row_height] * self.rows
         self._cell_styles = {}
+        self.locked = set()        # {(r,c)} 0-based 隐私遮罩格：禁止编辑
         self._merges = []
         self._covered = {}
         self._fonts = {}
@@ -270,7 +273,7 @@ class StyledSheet(ttk.Frame):
             except Exception:
                 pass
 
-    def _draw_text(self, x, y, w, h, text, rec, font_obj):
+    def _draw_text(self, x, y, w, h, text, rec, font_obj, masked=False):
         if text is None:
             return
         text = str(text)
@@ -338,8 +341,13 @@ class StyledSheet(ttk.Frame):
                     lines = [cut + "…"]
             except Exception:
                 pass
+        if masked:
+            tx, ax, ty, ay = x + w / 2, "center", y + h / 2, "center"
+            anchor = "center"
+            lines = [text]
         self.canvas.create_text(tx, ty, text="\n".join(lines), anchor=anchor,
-                                font=font_obj, fill=self._font_color(rec),
+                                font=font_obj,
+                                fill=MASK_FG if masked else self._font_color(rec),
                                 justify="center" if ax == "center" else "left")
 
     def _draw(self):
@@ -372,13 +380,14 @@ class StyledSheet(ttk.Frame):
                     continue
                 x, y, w, h = self._box(r, c)
                 rec = self._cell_styles.get((r, c))
+                locked = (r, c) in self.locked
                 self.canvas.create_rectangle(
                     x, y, x + w, y + h,
-                    fill=(rec or {}).get("fill") or "#FFFFFF",
+                    fill=MASK_BG if locked else ((rec or {}).get("fill") or "#FFFFFF"),
                     outline=GRID_LINE, width=1)
                 self._draw_border(x, y, w, h, rec)
                 self._draw_text(x, y, w, h, self.data[r][c], rec,
-                                self._font_for(rec))
+                                self._font_for(rec), masked=locked)
         # 合并单元格
         for (mr1, mc1, mr2, mc2) in self._merges:
             if mr2 < r0 or mr1 >= r1 or mc2 < c0 or mc1 >= c1:
@@ -453,6 +462,9 @@ class StyledSheet(ttk.Frame):
         r, c = self.active
         m = self._covered.get((r, c))
         r1, c1, r2, c2 = m if m else (r, c, r, c)
+        if (r1, c1) in getattr(self, "locked", ()):
+            self.event_generate("<<CellLocked>>")   # 隐私遮罩格：只读
+            return
         x, y, w, h = self._box(r1, c1, r2, c2)
         e = tk.Entry(self.canvas, justify="left", relief="solid", bd=1,
                      font=self._font_for(self._cell_styles.get((r1, c1))))
@@ -497,6 +509,9 @@ class StyledSheet(ttk.Frame):
 
     def _clear(self):
         r, c = self.active
+        if (r, c) in getattr(self, "locked", ()):
+            self.event_generate("<<CellLocked>>")
+            return
         if self.data[r][c] != "":
             self.data[r][c] = ""
             self.event_generate("<<SheetChanged>>")
@@ -525,6 +540,8 @@ class StyledSheet(ttk.Frame):
                     merge = self._covered.get((r, c))
                     if merge and (r, c) != (merge[0], merge[1]):
                         continue          # 合并区内部格只读，保护原样式
+                    if (r, c) in getattr(self, "locked", ()):
+                        continue          # 隐私遮罩格不可粘贴
                     if self.data[r][c] != val:
                         self.data[r][c] = val
                         changed = True
@@ -534,6 +551,16 @@ class StyledSheet(ttk.Frame):
         return "break"
 
     # ------------------------------------------------------------ 数据接口
+    def set_locked(self, cells):
+        """设置隐私遮罩格（0-based 坐标集合）：只读、灰底、不可粘贴"""
+        new = set(tuple(x) for x in (cells or ()))
+        if new == getattr(self, "locked", None):
+            return
+        self.locked = new
+        if self.editor is not None and self._edit_cell in new:
+            self.finish_edit(False)
+        self.schedule()
+
     def set_cell(self, r, c, text):
         if 0 <= r < self.rows and 0 <= c < self.columns:
             self.data[r][c] = "" if text is None else str(text)

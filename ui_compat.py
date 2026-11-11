@@ -49,6 +49,7 @@ class SimpleSheet(ttk.Frame):
         self.headers = headers or [chr(65 + i % 26) for i in range(columns)]
         self.data = [["" for _ in range(columns)] for _ in range(rows)]
         self.active = (0, 0)
+        self.locked = set()        # 隐私遮罩格（0-based），只读
         self._cols = [str(i) for i in range(columns)]
         self.tree = ttk.Treeview(self, columns=self._cols,
                                  show="tree headings", height=25)
@@ -94,6 +95,9 @@ class SimpleSheet(ttk.Frame):
             return
         if not (0 <= r < self.rows and 0 <= c < self.columns):
             return
+        if (r, c) in self.locked:
+            self.event_generate("<<CellLocked>>")
+            return
         bbox = self.tree.bbox(row, col)
         if not bbox:
             return
@@ -117,6 +121,14 @@ class SimpleSheet(ttk.Frame):
         e.bind("<Return>", commit)
         e.bind("<FocusOut>", commit)
         e.bind("<Escape>", lambda _ev: e.destroy())
+
+    def set_locked(self, cells):
+        """隐私遮罩格：只读（Treeview 整行着色，遮罩仅由 *** 文本体现）"""
+        self.locked = set(tuple(x) for x in (cells or ()))
+        try:
+            self.tree.tag_configure("masked", foreground="#9AA0A8")
+        except Exception:
+            pass
 
     def set_cell(self, r, c, text):
         if 0 <= r < self.rows and 0 <= c < self.columns:

@@ -78,6 +78,12 @@
   table.styled td{border:1px solid #d7dee8; background:#fff;}
   table.styled td.wrap{white-space:normal; word-break:break-all; overflow:hidden;}
   #stylehint{color:#1f7a4d; font-weight:bold;}
+  #privbar{display:flex; align-items:center; gap:8px; margin:0 14px;
+           padding:6px 10px; background:#FFF8E1; border:1px solid #F0DFA8;
+           border-radius:6px; color:#8A6100; font-size:12px;}
+  td.masked{background:#F1F3F6 !important; color:#9AA0A8 !important;
+            font-style:italic; text-align:center; cursor:not-allowed;}
+  td.masked.sel{outline:2px solid #C9CFD8;}
   /* ---------- 群聊侧栏（v3） ---------- */
   #chatpanel{position:fixed; top:0; right:0; width:360px; height:100vh; background:var(--panel);
              border-left:1px solid var(--border); box-shadow:-4px 0 18px rgba(0,0,0,.12);
@@ -154,6 +160,12 @@
     <span class="chip" id="peerchip" title="已发现的内网节点">节点 0</span>
     <span class="chip" id="roomchip">未加入房间</span>
     <button class="primary" onclick="toggleChat()">群聊 / 文件</button>
+  </div>
+
+  <div id="privbar" style="display:none">
+    <span id="privtext">🔒 隐私表格</span>
+    <span style="flex:1"></span>
+    <button class="mini" id="privbtn" onclick="openPrivacy()">设为隐私表格</button>
   </div>
 
   <div id="formulabar">
@@ -299,6 +311,13 @@ function poll(){
       if(d.style_version !== undefined && d.style_version !== styleVersion){
         styleVersion = d.style_version; since = 0;
       }
+      const prev = d.priv || {};
+      const nrev = Number(prev.rev || 0);
+      if(nrev !== privRev || (d.owner||"") !== privOwner){
+        privRev = nrev; privSpec = nrev ? prev : null; privOwner = d.owner || "";
+        updatePrivBar();
+        if(nrev) { since = 0; return; }     // 视角变了：强制全量重拉
+      }
       if(d.full){ cells = d.cells || {}; if(d.meta) meta = d.meta;
                   if(d.style !== undefined) styleInfo = d.style;
                   const rows = styleInfo ? styleInfo.rows : meta.rows;
@@ -308,7 +327,7 @@ function poll(){
                   since = d.seq; buildGrid(); }
       else if(d.edits && d.edits.length){
         for(const e of d.edits){ since = Math.max(since, e.seq);
-          for(const [k,[v,ts,who]] of Object.entries(e.cells)) cells[k]=[v,ts,who]; }
+          for(const [k,c] of Object.entries(e.cells)) cells[k]=[c[0],c[1],c[2],c[3]?1:0]; }
       }
       if(d.users) users = d.users;
       if(d.peers) $("peerchip").textContent = "节点 "+d.peers.length;
@@ -451,16 +470,24 @@ function render(){
   // 单元格值
   const view = new Set();
   for(let r=1;r<=maxR;r++) for(let c=1;c<=maxC;c++) view.add(cellKey(r,c));
-  for(const [k,[v,ts,who]] of Object.entries(cells)){
+  for(const [k,cell] of Object.entries(cells)){
     if(!view.has(k)) continue;
     const td = $("c"+k); if(!td) continue;
+    const v = cell[0], who = cell[2];
+    const hidden = !!cell[3];
     const isNum = typeof v==="number";
-    td.textContent = String(v);
+    td.textContent = hidden ? "***" : String(v);
     const wrapCls = td.classList.contains("wrap") ? "wrap " : "";
     td.className = wrapCls + (styleInfo ? "" : (isNum?"num ":"")) +
                    (selKey && k===selKey ? "sel " : "");
-    if(typeof v==="string" && v.startsWith("=")) td.style.color="#8e44ad";
-    else td.style.color = styleInfo ? (td.dataset.baseColor || "#1A1A1A") : "";
+    if(hidden){
+      td.classList.add("masked");
+      td.style.color = "";
+    } else {
+      td.classList.remove("masked");
+      if(typeof v==="string" && v.startsWith("=")) td.style.color="#8e44ad";
+      else td.style.color = styleInfo ? (td.dataset.baseColor || "#1A1A1A") : "";
+    }
     if(me && who===me.id) td.classList.add("mine") ;
   }
   // 他人光标
@@ -510,13 +537,20 @@ function select(r,c){
   document.querySelectorAll("td.sel").forEach(td=>td.classList.remove("sel"));
   const td=$("c"+tk); if(td){ td.classList.add("sel"); td.scrollIntoView({block:"nearest",inline:"nearest"}); }
   const cur = cells[tk] || cells[k];
-  $("finput").value = cur ? (typeof cur[0]==="number"?cur[0]:String(cur[0])) : "";
+  const isMasked = !!(cur && cur[3]);
+  $("finput").value = isMasked ? "" : (cur ? (typeof cur[0]==="number"?cur[0]:String(cur[0])) : "");
+  $("finput").disabled = isMasked;
+  $("finput").placeholder = isMasked
+    ? "🔒 这是他人填写的隐私内容（***），不能查看也不能修改"
+    : "输入内容后回车写入当前单元格；←→↑↓ 移动，Delete 清空，Esc 取消";
   $("cellref").textContent = ref(r,c);
   if(room) post("/api/presence",{room, cell:k});
 }
 function commit(move){
-  if(!sel || !editing && $("finput").value==="") { /* still allow empty write */ }
   if(!sel) return;
+  const curCell = cells[cellKey(sel.r,sel.c)];
+  if(curCell && curCell[3]){ editing = false; return; }   // 遮罩格只读
+  if(!editing && $("finput").value==="") { /* still allow empty write */ }
   const raw = $("finput").value;
   let v;
   if(raw==="") v = "";
@@ -524,7 +558,12 @@ function commit(move){
   else v = raw;
   const k = cellKey(sel.r,sel.c);
   cells[k] = [v, Date.now()*1e6, me.id];   // 本地乐观更新
-  post("/api/set",{room, cells:[{r:sel.r,c:sel.c,v}]}).catch(()=>{});
+  post("/api/set",{room, cells:[{r:sel.r,c:sel.c,v}]}).then(res=>{
+    if(res && res.ok === false){
+      toast(res.error || "写入被拒绝");
+      since = 0; delete cells[k];      // 被隐私规则拒绝：回滚并重新拉取
+    }
+  }).catch(()=>{});
   render();
   if(move==="down") select(Math.min(sel.r+1,maxR), sel.c);
   else if(move==="right") select(sel.r, Math.min(sel.c+1,maxC));
@@ -550,6 +589,7 @@ document.addEventListener("keydown", e=>{
 $("roomsel").addEventListener("change", ()=>{
   room = $("roomsel").value; since = 0; cells = {}; sel = null;
   styleInfo = null; styleVersion = -1; sheetNames = [];
+  privRev = -1; privSpec = null; privOwner = ""; updatePrivBar();
   refreshRooms([...$("roomsel").options].map(o=>o.value).filter(v=>v));
   if(room) toast("已切换到房间: "+room);
 });
@@ -587,7 +627,82 @@ function saveXlsx(saveAs){
   } else doSave(null);
 }
 
+/* ---------------- 隐私表格（v8） ---------------- */
+function compressNums(nums){
+  const a = [...new Set((nums||[]).map(Number).filter(n=>n>0))].sort((x,y)=>x-y);
+  if(!a.length) return "";
+  const out=[]; let st=a[0], pv=a[0];
+  for(const n of a.slice(1)){
+    if(n===pv+1){ pv=n; continue; }
+    out.push(st===pv?String(st):st+"-"+pv); st=pv=n;
+  }
+  out.push(st===pv?String(st):st+"-"+pv);
+  return out.join(",");
+}
+function compressCols(nums){
+  const a = [...new Set((nums||[]).map(Number).filter(n=>n>0))].sort((x,y)=>x-y);
+  if(!a.length) return "";
+  const out=[]; let st=a[0], pv=a[0];
+  const f=(x,y)=> x===y ? colName(x) : colName(x)+"-"+colName(y);
+  for(const n of a.slice(1)){
+    if(n===pv+1){ pv=n; continue; }
+    out.push(f(st,pv)); st=pv=n;
+  }
+  out.push(f(st,pv));
+  return out.join(",");
+}
+function describePriv(spec){
+  const bits=[];
+  if(spec.cols && spec.cols.length) bits.push(spec.cols.map(colName).join("、")+" 列");
+  if(spec.rows && spec.rows.length) bits.push(compressNums(spec.rows)+" 行");
+  return bits.length ? bits.join(" / ") : "未设置";
+}
+function updatePrivBar(){
+  const bar = $("privbar"), btn = $("privbtn");
+  if(!bar) return;
+  if(!privSpec || !privSpec.rev){
+    bar.style.display = "none";
+    btn.textContent = "设为隐私表格"; btn.disabled = false;
+    return;
+  }
+  bar.style.display = "flex";
+  const meId = (me && me.id) || "";
+  const isOwner = !privOwner || !meId || privOwner === meId;
+  let t = "🔒 隐私表格：" + describePriv(privSpec);
+  if(!isOwner) t += " · 你只能看到自己填写的内容，他人填写处显示 ***";
+  $("privtext").textContent = t;
+  btn.textContent = isOwner ? "修改隐私区域" : "只有发布者可设置";
+  btn.disabled = !isOwner;
+}
+function openPrivacy(){
+  if(!room){ toast("请先加入房间"); return; }
+  const cur = privSpec || {};
+  const on = confirm("把这张表格设为隐私表格？\n\n"
+    + "指定行/列后：只有「填写者本人」和「发布者」能看到内容，\n"
+    + "其他人看到 *** ，也改不了别人的内容。\n\n"
+    + "确定 = 隐私表格，取消 = 改为公开表格（原有方式）");
+  if(!on){
+    post("/api/room/privacy",{room,on:false}).then(res=>{
+      if(!res.ok){ toast("设置失败: "+res.error); return; }
+      privRev = -1; since = 0; toast("已改为公开表格");
+    });
+    return;
+  }
+  const cols = prompt("隐私列（表头字母或列号，如 D,E 或 4-6；留空表示不按列）",
+                      compressCols(cur.cols||[]));
+  if(cols === null) return;
+  const rows = prompt("隐私行（行号，如 3,5-8；留空表示不按行）",
+                      compressNums(cur.rows||[]));
+  if(rows === null) return;
+  post("/api/room/privacy",{room,on:true,cols:cols,rows:rows}).then(res=>{
+    if(!res.ok){ toast("设置失败: "+res.error); return; }
+    privRev = -1; since = 0;
+    toast("已保存隐私设置：" + (res.desc||""));
+  });
+}
+
 /* ---------------- 局域网群聊 / 文件传输（v3） ---------------- */
+let privSpec = null, privOwner = "", privRev = -1;   // v8 隐私表格
 let chatSeq = 0, curGid = "", chatGroups = [];
 let msgSeen = new Set(), needRebuild = false;
 let pinGroups = [], onlineMap = {};       // v6: 置顶群 / 成员在线状态

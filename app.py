@@ -26,6 +26,7 @@ from avatars import (CARTOON_COUNT, avatar_b64, cartoon_b64,   # noqa: E402
 from collab import human_size                        # noqa: E402
 from emojis import EMOJI_GROUPS, TEXT_FACES          # noqa: E402
 from emoji_assets import EmojiImages, split_text, has_emoji   # noqa: E402
+import privacy                                       # noqa: E402
 from sheetstyle import describe as style_summary     # noqa: E402
 from styled_sheet import StyledSheet                 # noqa: E402
 
@@ -104,6 +105,9 @@ class LanExcelApp:
         self._last_scan = ""
         self._transfer_sig = None
         self._member_list_sig = ()
+        self._priv_rev = -1          # 隐私设置版本，变化时强制全量重拉
+        self._priv_spec = {}
+        self._locked = set()
 
         self.pages = {}
         self.nav_buttons = {}
@@ -291,7 +295,8 @@ class LanExcelApp:
         for text, cmd, primary in [("新建房间", self.new_room, True),
                                    ("打开 Excel", self.open_xlsx, False),
                                    ("保存", lambda: self.save_xlsx(False), False),
-                                   ("另存为", lambda: self.save_xlsx(True), False)]:
+                                   ("另存为", lambda: self.save_xlsx(True), False),
+                                   ("隐私设置", self.show_privacy_dialog, False)]:
             make_button(bar, text, cmd, primary).pack(side="left", padx=3)
         ttk.Label(bar, text="工作表:").pack(side="left", padx=(10, 0))
         self.sheet_cb = ttk.Combobox(bar, textvariable=self.sheet_var,
@@ -311,8 +316,22 @@ class LanExcelApp:
         self.sheet = self.plain_sheet
         self.plain_sheet.bind("<<SheetChanged>>", self.on_sheet_changed)
         self.plain_sheet.bind("<<SheetSelect>>", self.on_sheet_select)
+        self.plain_sheet.bind("<<CellLocked>>", self._on_cell_locked)
+        self.priv_bar = tk.Frame(f, bg="#FFF8E1")
+        self.priv_label = tk.Label(self.priv_bar, text="", anchor="w",
+                                   bg="#FFF8E1", fg="#8A6100",
+                                   font=(FONT, 9), padx=10, pady=5,
+                                   justify="left")
+        self.priv_label.pack(side="left", fill="x", expand=True)
+        self.priv_btn = tk.Label(self.priv_bar, text="设置隐私区域",
+                                 bg="#FFF8E1", fg="#0067C0", font=(FONT, 9),
+                                 cursor="hand2", padx=10)
+        self.priv_btn.pack(side="right")
+        self.priv_btn.bind("<Button-1>", lambda e: self.show_privacy_dialog())
         ttk.Label(f, textvariable=self.info, style="Muted.TLabel").pack(
             fill="x", pady=(6, 0))
+        self.priv_bar.pack(fill="x", pady=(4, 0))
+        self.priv_bar.pack_forget()
         # Excel 式底部工作表标签栏：显示工作簿的全部工作表，点击即切换
         self.sheet_tabbar = ttk.Frame(f)
         self.sheet_tabbar.pack(side="bottom", fill="x", pady=(8, 0))
@@ -656,6 +675,7 @@ class LanExcelApp:
                                         column_width=104, row_height=27)
         self.styled_sheet.bind("<<SheetChanged>>", self.on_sheet_changed)
         self.styled_sheet.bind("<<SheetSelect>>", self.on_sheet_select)
+        self.styled_sheet.bind("<<CellLocked>>", self._on_cell_locked)
         return self.styled_sheet
 
     # ------------------------------------------------------------ 表格同步
@@ -680,6 +700,12 @@ class LanExcelApp:
                 pass
         target.pack(fill="both", expand=True)
         self.sheet = target
+        setter = getattr(target, "set_locked", None)
+        if setter and getattr(self, "_locked", None):
+            try:
+                setter(set(self._locked))
+            except Exception:
+                pass
 
     def _update_sheet_choices(self):
         self.sheet_cb["values"] = self._sheet_names
@@ -782,6 +808,9 @@ class LanExcelApp:
         self.since = 0
         self.grid_state = {}
         self._style_version = -1
+        self._priv_rev = -1
+        self._priv_spec = {}
+        self._locked = set()
         self.node.my_presence["room"] = name
         self._update_sheet_choices()
 
@@ -799,8 +828,15 @@ class LanExcelApp:
                 self.grid_state[(r, c)] = val
                 cells["%d,%d" % (r + 1, c + 1)] = [to_value(val), ts, self.node.id]
         if cells:
-            self.node.apply_edit(self.room, cells, local=True)
-            self.info.set("已同步 %d 个单元格 · 房间: %s" % (len(cells), self.room))
+            try:
+                self.node.apply_edit(self.room, cells, local=True)
+                self.info.set("已同步 %d 个单元格 · 房间: %s"
+                              % (len(cells), self.room))
+            except ValueError as e:
+                # 隐私格被他人占用：放弃这次写入，恢复成服务端的数据
+                self.info.set("⚠ " + str(e))
+                self.since = 0
+                self.poll_room()
 
     def on_sheet_select(self, event=None):
         if not self.room:
@@ -823,30 +859,215 @@ class LanExcelApp:
             self._style_version = info.get("version", 0)
             self._apply_room_style(info)
         d = self.node.poll(self.since, self.room)
+        # 隐私设置变化：本机视角整体变了，必须全量重拉一次
+        p = d.get("priv") or {}
+        rev = int(p.get("rev", 0))
+        if rev != self._priv_rev:
+            self._priv_rev = rev
+            self._priv_spec = p
+            self.since = 0
+            self._update_priv_bar(p, d.get("owner", ""))
+            if rev:
+                d = self.node.poll(0, self.room)
         self.since = d.get("seq", self.since)
+        locked = set()
         if d.get("full"):
             cells = d.get("cells", {})
             matrix = [["" for _ in range(self.view_cols)]
                       for _ in range(self.view_rows)]
             self.grid_state = {(r, c): "" for r in range(self.view_rows)
                                for c in range(self.view_cols)}
-            for key, (v, ts, who) in cells.items():
+            for key, cell in cells.items():
                 r, c = (int(x) - 1 for x in key.split(","))
-                if 0 <= r < self.view_rows and 0 <= c < self.view_cols:
-                    text = str(v)
-                    matrix[r][c] = text
-                    self.grid_state[(r, c)] = text
+                if not (0 <= r < self.view_rows and 0 <= c < self.view_cols):
+                    continue
+                text = self._cell_text(cell)
+                if len(cell) > 3 and cell[3]:
+                    locked.add((r, c))
+                matrix[r][c] = text
+                self.grid_state[(r, c)] = text
             self.sheet.set_data(matrix, rows=self.view_rows,
                                 columns=self.view_cols)
+            self._set_locked(locked)
         else:
+            changed = False
             for e in d.get("edits", []):
-                for key, (v, ts, who) in e["cells"].items():
+                for key, cell in e["cells"].items():
                     r, c = (int(x) - 1 for x in key.split(","))
-                    if 0 <= r < self.view_rows and 0 <= c < self.view_cols:
-                        text = str(v)
-                        if self.grid_state.get((r, c), "") != text:
-                            self.grid_state[(r, c)] = text
-                            self.sheet.set_cell(r, c, text)
+                    if not (0 <= r < self.view_rows and 0 <= c < self.view_cols):
+                        continue
+                    text = self._cell_text(cell)
+                    hidden = len(cell) > 3 and bool(cell[3])
+                    if hidden != ((r, c) in self._locked):
+                        if hidden:
+                            locked.add((r, c))
+                        else:
+                            self._locked.discard((r, c))
+                        changed = True
+                    if self.grid_state.get((r, c), "") != text:
+                        self.grid_state[(r, c)] = text
+                        self.sheet.set_cell(r, c, text)
+            if changed:
+                self._set_locked(locked or {x for x in self._locked})
+
+    @staticmethod
+    def _cell_text(cell):
+        v = cell[0] if cell else ""
+        if len(cell) > 3 and cell[3]:
+            return "***"
+        return "" if v is None else str(v)
+
+    def _set_locked(self, cells):
+        cells = set(cells)
+        self._locked = cells
+        setter = getattr(self.sheet, "set_locked", None)
+        if setter:
+            try:
+                setter(cells)
+            except Exception:
+                pass
+
+    def _update_priv_bar(self, spec, owner=""):
+        """表格页顶部的隐私状态条"""
+        if bool(spec) and bool(spec.get("on")):
+            is_owner = (owner or self.node.id) == self.node.id
+            text = privacy.describe(spec)
+            if not is_owner:
+                text += " · 你只能看到自己填写的内容，他人填写处以 *** 显示"
+            self.priv_label.configure(text="🔒  " + text)
+            if is_owner:
+                self.priv_btn.configure(text="修改隐私区域")
+            else:
+                with self.node.peers_lock:
+                    pname = (self.node.peers.get(owner) or {}).get("name") or ""
+                pname = pname or (owner[:8] if owner else "同伴")
+                self.priv_btn.configure(text="发布者：%s" % pname)
+            if not self.priv_bar.winfo_ismapped():
+                self.priv_bar.pack(fill="x", pady=(4, 0))
+        else:
+            self.priv_btn.configure(text="设为隐私表格")
+            self.priv_bar.pack_forget()
+
+    def _on_cell_locked(self, event=None):
+        self.info.set("🔒 这个单元格是他人填写的隐私内容，已用 *** 遮掩，不能查看或修改")
+
+    # ------------------------------------------------------------ 隐私表格
+    def show_privacy_dialog(self, initial=None):
+        """发布者设置哪些行 / 列属于隐私区域"""
+        if not self.room:
+            self._alert("请先打开或新建一个协作表格")
+            return
+        info = self.node.room_privacy(self.room) or {}
+        cur = initial or info.get("priv") or {}
+        if info and not info.get("is_owner", True):
+            with self.node.peers_lock:
+                pname = (self.node.peers.get(info.get("owner", "")) or {}).get("name")
+            messagebox.showinfo(
+                "隐私设置",
+                "这张表格由 %s 发布，只有发布者可以设置隐私区域。\n\n%s"
+                % (pname or (info.get("owner") or "")[:8], privacy.describe(cur)),
+                parent=self.root)
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("隐私表格设置")
+        top.transient(self.root)
+        top.resizable(False, False)
+        top.configure(bg="#FFFFFF")
+        wrap = ttk.Frame(top, padding=16)
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="隐私表格：指定的行 / 列只有「填写者本人」和「发布者」可见，\n"
+                            "其他人看到的是 *** ，也改不了别人的内容。",
+                  justify="left").pack(anchor="w")
+        ttk.Label(wrap, text="公开表格（原有协作方式，所有人可见可编辑）",
+                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+
+        on_var = tk.BooleanVar(value=bool(cur.get("on")))
+        row_on = ttk.Frame(wrap)
+        row_on.pack(fill="x", pady=(6, 2))
+        ttk.Radiobutton(row_on, text="公开表格", value=False,
+                        variable=on_var).pack(side="left")
+        ttk.Radiobutton(row_on, text="隐私表格", value=True,
+                        variable=on_var).pack(side="left", padx=(14, 0))
+
+        ttk.Label(wrap, text="隐私列（表头字母或列号，如 D,E 或 4-6）").pack(
+            anchor="w", pady=(10, 2))
+        cols_var = tk.StringVar(value=privacy.compress_cols(cur.get("cols")))
+        ttk.Entry(wrap, textvariable=cols_var, width=46).pack(anchor="w")
+
+        ttk.Label(wrap, text="隐私行（行号，如 3,5-8）").pack(anchor="w", pady=(10, 2))
+        rows_var = tk.StringVar(value=privacy.compress(cur.get("rows") or []))
+        ttk.Entry(wrap, textvariable=rows_var, width=46).pack(anchor="w")
+
+        bar = ttk.Frame(wrap)
+        bar.pack(fill="x", pady=(6, 0))
+
+        def add_current(which):
+            try:
+                r, c = self.sheet.active
+            except Exception:
+                return
+            if which == "col":
+                nums = privacy.parse_cols(cols_var.get()) + [c + 1]
+                cols_var.set(privacy.compress_cols(nums))
+            else:
+                nums = privacy.parse_rows(rows_var.get()) + [r + 1]
+                rows_var.set(privacy.compress(nums))
+        make_button(bar, "＋ 当前选中列", lambda: add_current("col")).pack(side="left")
+        make_button(bar, "＋ 当前选中行", lambda: add_current("row")).pack(
+            side="left", padx=6)
+
+        prev = ttk.Label(wrap, text="", style="Muted.TLabel", justify="left")
+        prev.pack(anchor="w", pady=(10, 0))
+
+        def refresh_preview(*_):
+            if not on_var.get():
+                prev.configure(text="当前：公开表格，行为与原协作表格完全一致")
+                return
+            spec = {"on": 1, "rows": privacy.parse_rows(rows_var.get()),
+                    "cols": privacy.parse_cols(cols_var.get())}
+            if not spec["rows"] and not spec["cols"]:
+                prev.configure(text="⚠ 请至少填写一组隐私行或隐私列")
+            else:
+                prev.configure(text="当前：" + privacy.describe(spec))
+        for var in (cols_var, rows_var):
+            var.trace_add("write", refresh_preview)
+        on_var.trace_add("write", refresh_preview)
+        refresh_preview()
+
+        tip = ttk.Label(wrap, text="提示：建议在发布表格时就设置好隐私区域；\n"
+                                   "已经公开同步出去的内容无法收回。",
+                        style="Muted.TLabel", justify="left")
+        tip.pack(anchor="w", pady=(8, 0))
+
+        btns = ttk.Frame(wrap)
+        btns.pack(fill="x", pady=(12, 0))
+
+        def apply():
+            rows = privacy.parse_rows(rows_var.get())
+            cols = privacy.parse_cols(cols_var.get())
+            if on_var.get() and not rows and not cols:
+                messagebox.showwarning("隐私设置", "请至少填写一组隐私行或隐私列",
+                                       parent=top)
+                return
+            try:
+                self.node.set_privacy(self.room, rows=rows, cols=cols,
+                                      on=on_var.get())
+            except Exception as e:
+                messagebox.showerror("设置失败", str(e), parent=top)
+                return
+            top.destroy()
+            self._priv_rev = -1
+            self.since = 0
+            self.poll_room()
+            self._alert("已保存隐私设置：\n" + privacy.describe(
+                {"on": 1, "rows": rows, "cols": cols} if on_var.get() else None))
+
+        make_button(btns, "保存", apply, True).pack(side="right")
+        make_button(btns, "取消", top.destroy).pack(side="right", padx=6)
+        top.grab_set()
+        return top
 
     # ------------------------------------------------------------ 群聊逻辑
     def _avatar_for(self, pid, data=""):
@@ -1798,6 +2019,14 @@ class LanExcelApp:
             self._alert("已转为协作表格：%s\n房间：%s\n读取 %d 个单元格\n"
                         "群成员会自动加入并共同编辑"
                         % (os.path.basename(path), info["room"], len(info["cells"])))
+            if messagebox.askyesno(
+                    "隐私表格",
+                    "要把这张群内表格设为隐私表格吗？\n\n"
+                    "指定行/列后，群成员互相看不到对方填写的内容，"
+                    "只有你（发布者）能看到全部。",
+                    parent=self.root):
+                self._priv_rev = -1
+                self.show_privacy_dialog()
         except Exception as e:
             messagebox.showerror("发送失败", str(e))
 
@@ -2088,6 +2317,15 @@ class LanExcelApp:
                 % (os.path.basename(path), info["room"], len(info["cells"]),
                    " / ".join(info.get("sheets", [])),
                    info.get("style", "")))
+            if messagebox.askyesno(
+                    "隐私表格",
+                    "要把这张表格发布为隐私表格吗？\n\n"
+                    "隐私表格可以指定某些行/列只有「填写者本人」和「你（发布者）」"
+                    "能看到，其他人看到 *** 且无法修改。\n\n"
+                    "选「否」= 普通公开协作表格（原有方式）。",
+                    parent=self.root):
+                self._priv_rev = -1
+                self.show_privacy_dialog()
         except Exception as e:
             messagebox.showerror("打开失败", str(e))
 

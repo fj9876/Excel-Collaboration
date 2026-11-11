@@ -222,6 +222,9 @@ try:
 except Exception:
     pass
 a = app_mod.LanExcelApp(root, n_b)
+a.show_page("chat")           # 懒构建：先把聊天页建出来
+while a._deferred:
+    a.root.update()
 a.current_gid = gid
 a.group_ids = [gid]
 a._groups_sig = "x"

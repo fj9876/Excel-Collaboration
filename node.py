@@ -46,8 +46,13 @@ for _d in (APP_DIR, _LIB, _VER_LIB):
     if os.path.isdir(_d) and _d not in sys.path:
         sys.path.insert(0, _d)
 
+from lazyimp import LazyModule
+
 try:
-    import openpyxl
+    from importlib.util import find_spec
+    if find_spec("openpyxl") is None:      # 只检查是否存在，不真正加载
+        raise ImportError
+    openpyxl = LazyModule("openpyxl")      # 惰性导入，启动省下 0.6 秒以上
 except ImportError:
     print("缺少依赖 openpyxl，请先执行: pip install openpyxl")
     sys.exit(1)

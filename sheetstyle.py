@@ -23,8 +23,9 @@ import warnings
 import zipfile
 import xml.etree.ElementTree as ET
 
-import openpyxl
-from openpyxl.utils import get_column_letter
+from lazyimp import LazyModule
+
+openpyxl = LazyModule("openpyxl")          # 惰性导入：只在真正读写 xlsx 时才加载
 
 # 渲染用的默认尺寸（像素）
 DEFAULT_COL_PX = 96
@@ -158,7 +159,7 @@ def extract_style(path, sheet_name=None):
             b = column_index_from_string(end) if end else a
             if dim.width:
                 for idx in range(a, min(b, max_col_idx) + 1):
-                    col_widths[get_column_letter(idx)] = _col_px(dim.width)
+                    col_widths[openpyxl.utils.get_column_letter(idx)] = _col_px(dim.width)
         except Exception:
             pass
 
@@ -290,7 +291,7 @@ def _parse_coord(coord):
 
 
 def _coord(r, c):
-    return (get_column_letter(c) + str(r)).encode("ascii")
+    return (openpyxl.utils.get_column_letter(c) + str(r)).encode("ascii")
 
 
 def _esc(text):

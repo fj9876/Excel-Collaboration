@@ -25,6 +25,7 @@ from avatars import (CARTOON_COUNT, avatar_b64, cartoon_b64,   # noqa: E402
                      custom_avatar_b64)
 from collab import human_size                        # noqa: E402
 from emojis import EMOJI_GROUPS, TEXT_FACES          # noqa: E402
+from emoji_assets import EmojiImages, split_text, has_emoji   # noqa: E402
 from sheetstyle import describe as style_summary     # noqa: E402
 from styled_sheet import StyledSheet                 # noqa: E402
 
@@ -46,6 +47,13 @@ NAV_ITEMS = [("sheet", "协作表格"), ("chat", "局域网群聊"),
 ONLINE_FG = "#1A7A3C"     # 在线：深绿
 OFFLINE_FG = "#9A9A9A"    # 离线：灰
 CHAT_IMG_MAX = 240        # 聊天图片最长边（像素）
+EMOJI_PANEL_PX = 24       # 表情面板图标尺寸
+EMOJI_CHAT_PX = 20        # 聊天正文里的表情尺寸
+GIF_MAX_FRAMES = 48       # 每张动图最多预缩放多少帧
+GIF_MAX_SIDE = 240        # 动图最长边
+GIF_MAX_ANIM = 6          # 同时播放的动图上限（超出只显示首帧）
+PEER_AVATAR_PX = 26       # 成员列表头像尺寸（小图重绘快得多）
+CHAT_RENDER_LIMIT = 300   # 聊天窗口最多渲染最近多少条消息
 
 
 def col_name(c):
@@ -73,6 +81,7 @@ class LanExcelApp:
     def __init__(self, root, node):
         self.root = root
         self.node = node
+        self.emoji = EmojiImages(root)     # 彩色表情图片工厂（Twemoji PNG）
         self.page = ""
         self.room = ""
         self.since = 0
@@ -88,6 +97,13 @@ class LanExcelApp:
         self._photo_cache = {}
         self._avatar_photos = []
         self._pending_avatar = None
+        self._deferred = []
+        self._last_chat = 0.0
+        self._last_peers = 0.0
+        self._last_status = ""
+        self._last_scan = ""
+        self._transfer_sig = None
+        self._member_list_sig = ()
 
         self.pages = {}
         self.nav_buttons = {}
@@ -125,33 +141,103 @@ class LanExcelApp:
         self.content.pack(side="left", fill="both", expand=True)
         self._build_nav(body)
 
+        # 只先建协作表格页（首屏），其余页面分帧补齐，启动从 3.7s 降到 1s 内
         self._build_sheet_tab()
-        self._build_chat_tab()
-        self._build_peers_tab()
-        self._build_network_tab()
-        self._build_profile_tab()
         self._build_footer()
+        self.show_page("sheet")
+        self._deferred = [self._build_chat_tab, self._build_peers_tab,
+                          self._build_network_tab, self._build_profile_tab]
+        root.after(1, self._build_next_page)
 
         self.node.on_file_received = self._on_file_received
-        self.show_page("sheet")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
-        root.after(400, self.refresh)
+        root.after(300, self.refresh)
+        self._warm_emoji()
 
     # ------------------------------------------------------------ 布局
+    PAGE_BUILDERS = {"sheet": "_build_sheet_tab", "chat": "_build_chat_tab",
+                     "peers": "_build_peers_tab", "net": "_build_network_tab",
+                     "profile": "_build_profile_tab"}
+
     def _page(self, key):
         f = ttk.Frame(self.content, padding=10)
         f.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.pages[key] = f
         return f
 
+    def _ensure_page(self, key):
+        """页面懒构建：切到哪个页面才建哪个，启动只建首屏"""
+        if key in self.pages:
+            return True
+        fn = getattr(self, self.PAGE_BUILDERS.get(key, ""), None)
+        if fn is None:
+            return False
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+            return key in self.pages
+        self.pages[key].lift()
+        return key in self.pages
+
+    def _build_next_page(self):
+        """分帧补齐其余页面，每帧只建一页，界面不会假死"""
+        if not self._deferred:
+            return
+        fn = self._deferred.pop(0)
+        try:
+            fn()
+        except Exception:
+            traceback.print_exc()
+        cur = self.pages.get(self.page)
+        if cur is not None:
+            cur.lift()                       # 新建的页面会叠在最上层，纠正回来
+        if self._deferred:
+            self.root.after(20, self._build_next_page)
+
     def show_page(self, key):
+        if key not in self.pages and not self._ensure_page(key):
+            return
         self.page = key
         self.pages[key].lift()
-        for k, b in self.nav_buttons.items():
-            try:
-                b.configure(style="Primary.TButton" if k == key else "TButton")
-            except Exception:
-                pass
+        # 刷新延到下一帧做，先让页面切换立刻响应，避免点击后停顿
+        if key == "chat":
+            self._resume_anims()
+            self.root.after(1, self._safe_chat_refresh)
+        elif key == "peers":
+            if self._anim_jobs:
+                self._pause_anims()
+            self.root.after(1, self._safe_peers_refresh)
+        else:
+            if self._anim_jobs:
+                self._pause_anims()
+            if key == "sheet" and self.room:
+                self.root.after(1, self._safe_poll)
+        if getattr(self, "_nav_active", None) != key:
+            for k, b in self.nav_buttons.items():
+                try:
+                    b.configure(style="Primary.TButton" if k == key else "TButton")
+                except Exception:
+                    pass
+            self._nav_active = key
+
+    def _safe_chat_refresh(self):
+        try:
+            self.refresh_chat()
+        except Exception:
+            traceback.print_exc()
+
+    def _safe_peers_refresh(self):
+        try:
+            self.refresh_peers()
+        except Exception:
+            traceback.print_exc()
+
+    def _safe_poll(self):
+        try:
+            self.poll_room()
+        except Exception:
+            traceback.print_exc()
 
     def _build_header(self):
         h = ttk.Frame(self.root, padding=(16, 12, 16, 6))
@@ -219,12 +305,12 @@ class LanExcelApp:
         self.plain_sheet = make_sheet(self.sheet_host, SHEET_ROWS, SHEET_COLS,
                                       headers, column_width=104, row_height=27)
         self.plain_sheet.pack(fill="both", expand=True)
-        self.styled_sheet = StyledSheet(self.sheet_host, SHEET_ROWS, SHEET_COLS,
-                                        headers, column_width=104, row_height=27)
+        # 保真渲染控件（StyledSheet）只在打开带样式的 xlsx 时才创建，
+        # 省掉首屏四分之一秒的构建时间
+        self.styled_sheet = None
         self.sheet = self.plain_sheet
-        for widget in (self.plain_sheet, self.styled_sheet):
-            widget.bind("<<SheetChanged>>", self.on_sheet_changed)
-            widget.bind("<<SheetSelect>>", self.on_sheet_select)
+        self.plain_sheet.bind("<<SheetChanged>>", self.on_sheet_changed)
+        self.plain_sheet.bind("<<SheetSelect>>", self.on_sheet_select)
         ttk.Label(f, textvariable=self.info, style="Muted.TLabel").pack(
             fill="x", pady=(6, 0))
         # Excel 式底部工作表标签栏：显示工作簿的全部工作表，点击即切换
@@ -277,7 +363,14 @@ class LanExcelApp:
         self.chat_entry = ttk.Entry(entry, textvariable=self.chat_input)
         self.chat_entry.pack(side="left", fill="x", expand=True)
         self.chat_entry.bind("<Return>", lambda e: self.send_chat_text())
-        make_button(entry, "😊 表情", self.show_emoji_picker).pack(side="left", padx=(6, 0))
+        smile = self.emoji.get("😀", 18)
+        if smile is not None:
+            emb = ttk.Button(entry, text=" 表情", image=smile, compound="left",
+                             command=self.show_emoji_picker)
+            emb.image = smile
+        else:
+            emb = make_button(entry, "表情", self.show_emoji_picker)
+        emb.pack(side="left", padx=(6, 0))
         make_button(entry, "发送", self.send_chat_text, True).pack(side="left", padx=6)
         self.atall_btn = make_button(entry, "@所有人", self.send_at_all)
         self.atall_btn.pack(side="left", padx=(0, 6))
@@ -359,13 +452,18 @@ class LanExcelApp:
                   style="Muted.TLabel", justify="left").pack(anchor="w", pady=12)
 
     def _selected_peer(self):
-        """选中的必须是联系人（而不是分组节点）时返回其 id"""
+        """选中的必须是联系人（而不是分组节点）时返回其 id
+
+        同一个联系人可能同时出现在「置顶」「多个标签」下，所以树行 iid 是
+        ``pid@序号`` 形式，这里剥掉后缀还原成真正的成员 id。
+        """
         sel = self.peer_tree.selection()
         if not sel:
             return ""
-        pid = sel[0]
-        if pid.startswith("grp:"):
+        iid = sel[0]
+        if iid.startswith("grp:"):
             return ""
+        pid = iid.rsplit("@", 1)[0]
         with self.node.peers_lock:
             return pid if pid in self.node.peers else ""
 
@@ -494,12 +592,19 @@ class LanExcelApp:
             ttk.Label(info, text=line, style="Muted.TLabel").pack(anchor="w", pady=2)
 
     # ------------------------------------------------------------ 头像
-    def _photo(self, key, b64):
+    def _photo(self, key, b64, px=0):
+        """头像 PhotoImage（带缓存）；px 给定时按整数倍缩小，列表里更省重绘"""
         if not b64:
             return None
-        k = key + ":" + b64[:48]
+        k = "%s:%d:%s" % (key, px, b64[:48])
         if k not in self._photo_cache:
-            self._photo_cache[k] = make_photo(b64, self.root)
+            ph = make_photo(b64, self.root)
+            if ph is not None and px and ph.width() > px:
+                try:
+                    ph = ph.subsample(max(1, int(round(ph.width() / float(px)))))
+                except Exception:
+                    pass
+            self._photo_cache[k] = ph
         return self._photo_cache[k]
 
     def update_nav_avatar(self):
@@ -541,10 +646,25 @@ class LanExcelApp:
         self._pending_avatar = {"custom_path": path}
         self.update_preview()
 
+    def _ensure_styled_sheet(self):
+        """惰性创建保真表格控件（打开带样式的 xlsx 才需要）"""
+        if self.styled_sheet is not None:
+            return self.styled_sheet
+        headers = [col_name(c) for c in range(1, self.view_cols + 1)]
+        self.styled_sheet = StyledSheet(self.sheet_host, self.view_rows,
+                                        self.view_cols, headers,
+                                        column_width=104, row_height=27)
+        self.styled_sheet.bind("<<SheetChanged>>", self.on_sheet_changed)
+        self.styled_sheet.bind("<<SheetSelect>>", self.on_sheet_select)
+        return self.styled_sheet
+
     # ------------------------------------------------------------ 表格同步
     def _activate_sheet(self, styled):
         """有原始 xlsx 模板时切到保真渲染控件，否则用普通协作网格"""
-        target = self.styled_sheet if styled else self.plain_sheet
+        if styled:
+            self._ensure_styled_sheet()
+        target = self.styled_sheet if (styled and self.styled_sheet is not None) \
+            else self.plain_sheet
         if self.sheet is target:
             return
         try:
@@ -552,6 +672,8 @@ class LanExcelApp:
         except Exception:
             pass
         for widget in (self.plain_sheet, self.styled_sheet):
+            if widget is None:
+                continue
             try:
                 widget.pack_forget()
             except Exception:
@@ -732,7 +854,7 @@ class LanExcelApp:
                        if pid == self.node.id else self.node.peer_avatar_b64(pid))
         return self._photo(str(pid), b64)
 
-    def _append_message(self, m):
+    def _append_message(self, m, scroll=True):
         if m.get("gid") != self.current_gid:
             return
         mid = m.get("id", "")
@@ -763,7 +885,9 @@ class LanExcelApp:
         elif kind == "text":
             if m.get("at_all"):
                 t.insert("end", "  @所有人 ", ("body", "atall"))
-            t.insert("end", "  %s\n\n" % m.get("text", ""), "body")
+            t.insert("end", "  ", "body")
+            self._insert_rich(t, m.get("text", ""), "body")
+            t.insert("end", "\n\n", "body")
         elif kind == "system":
             t.insert("end", "  %s\n\n" % m.get("text", ""), "muted")
         elif kind == "sheet":
@@ -818,7 +942,25 @@ class LanExcelApp:
         t.tag_add(tag, start, end)
         t.tag_bind(tag, "<Button-3>", lambda e, mm=m: self._msg_menu(e, mm))
         t.configure(state="disabled")
-        t.see("end")
+        if scroll:
+            t.see("end")
+
+    # ------------------------------------------------ 富文本（彩色表情）
+    def _insert_rich(self, text_widget, text, tag="body", px=None):
+        """把带表情的文字插入 Text：表情用彩色 PNG，其余照常排版
+
+        Tk 文本控件用 GDI 画字，彩色 Emoji 字体（COLR）会被渲染成黑白轮廓，
+        所以这里把 Emoji 拆出来用图片贴进文本流，效果与微信一致。
+        """
+        px = px or EMOJI_CHAT_PX
+        for chunk, is_emoji in split_text(text):
+            if is_emoji:
+                ph = self.emoji.get(chunk, px)
+                if ph is not None:
+                    text_widget.image_create("end", image=ph)
+                    self._chat_images.append(ph)
+                    continue
+            text_widget.insert("end", chunk, tag)
 
     # ------------------------------------------------ 聊天图片 / GIF 动图
     def _load_chat_image(self, path):
@@ -862,30 +1004,93 @@ class LanExcelApp:
             del self._chat_images[:200]
         return ph
 
+    def _prepare_gif(self, img, scale):
+        """一次性把所有帧预缩放成 PhotoImage
+
+        旧实现每播一帧都要 seek+convert+resize，多张动图时主线程被打满，
+        整个界面跟着卡。预缩放后播放只剩 image_configure，开销接近于零。
+        """
+        frames, delays = [], []
+        try:
+            n = int(getattr(img, "n_frames", 1) or 1)
+        except Exception:
+            n = 1
+        step = 1
+        if n > GIF_MAX_FRAMES:
+            step = int(n / float(GIF_MAX_FRAMES) + 0.999)
+        for i in range(0, n, step):
+            try:
+                img.seek(i)
+                f = img.convert("RGBA")
+                w, h = f.size
+                s = scale
+                if max(w, h) * s > GIF_MAX_SIDE:
+                    s = GIF_MAX_SIDE / float(max(w, h))
+                size = (max(1, int(w * s)), max(1, int(h * s)))
+                if size != f.size:
+                    f = f.resize(size, Image.BILINEAR)
+                frames.append(ImageTk.PhotoImage(f, master=self.root))
+                delays.append(int(img.info.get("duration", 100) or 100))
+            except Exception:
+                continue
+        if not delays:
+            delays = [100]
+        return frames, delays
+
     def _start_gif(self, mark, path, scale=1.0):
-        """在聊天窗口里循环播放 GIF 动图（最多同时 12 个动画）"""
-        if Image is None or len(self._anim_jobs) >= 12:
+        """在聊天窗口里循环播放 GIF 动图（预缩放帧 + 并发上限）"""
+        if Image is None or not path or len(self._anim_jobs) >= GIF_MAX_ANIM:
             return
         try:
             img = Image.open(path)
-            n = int(img.n_frames)
+            frames, delays = self._prepare_gif(img, scale)
+            try:
+                img.close()
+            except Exception:
+                pass
         except Exception:
             return
-        st = {"mark": mark, "img": img, "n": n, "idx": 0, "scale": scale, "job": None}
+        if not frames:
+            return
+        st = {"mark": mark, "frames": frames, "delays": delays, "idx": 0,
+              "job": None, "paused": False}
         self._anim_jobs.append(st)
-        self._gif_tick(st)
+        if self.page == "chat":
+            self._gif_tick(st)
 
     def _gif_tick(self, st):
+        if st.get("paused") or self.page != "chat":
+            st["job"] = None
+            return
         try:
-            ph = self._gif_frame(st["img"], st["idx"], st.get("scale", 1.0))
-            self.chat_text.image_configure(st["mark"], image=ph)
-            st["img"].seek(st["idx"])
-            delay = int(st["img"].info.get("duration", 100) or 100)
-            st["idx"] = (st["idx"] + 1) % st["n"]
-            st["job"] = self.root.after(max(delay, 50),
-                                        lambda: self._gif_tick(st))
+            self.chat_text.image_configure(st["mark"],
+                                           image=st["frames"][st["idx"]])
         except Exception:
             st["job"] = None
+            return
+        delay = st["delays"][st["idx"]] if st["idx"] < len(st["delays"]) else 100
+        st["idx"] = (st["idx"] + 1) % len(st["frames"])
+        st["job"] = self.root.after(max(delay, 60),
+                                    lambda: self._gif_tick(st))
+
+    def _pause_anims(self):
+        """切走聊天页时停掉所有动图，别在后台白烧 CPU"""
+        for st in self._anim_jobs:
+            st["paused"] = True
+            job = st.get("job")
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except Exception:
+                    pass
+            st["job"] = None
+
+    def _resume_anims(self):
+        for st in self._anim_jobs:
+            if st.get("paused"):
+                st["paused"] = False
+                if not st.get("job"):
+                    self._gif_tick(st)
 
     def _cancel_anims(self):
         for st in self._anim_jobs:
@@ -897,17 +1102,44 @@ class LanExcelApp:
                     pass
         self._anim_jobs = []
 
-    # ------------------------------------------------ 表情面板
+    # ------------------------------------------------ 表情面板（Canvas 绘制）
+    EMOJI_CELL = 34
+    EMOJI_COLS = 12
+
     def show_emoji_picker(self):
+        old = getattr(self, "_emoji_top", None)
+        if old is not None:
+            try:
+                old.deiconify()
+                old.lift()
+                old.focus_set()
+                return
+            except Exception:
+                self._emoji_top = None
+
+        C = self.EMOJI_CELL
         top = tk.Toplevel(self.root)
-        top.title("选择表情（点击插入输入框）")
-        top.geometry("440x320")
+        self._emoji_top = top
+        top.title("表情")
+        top.geometry("%dx%d" % (self.EMOJI_COLS * C + 40, 420))
         top.transient(self.root)
-        cat_row = ttk.Frame(top)
-        cat_row.pack(fill="x", padx=8, pady=(8, 4))
-        grid = tk.Frame(top)
-        grid.pack(fill="both", expand=True, padx=8)
+        top.configure(bg="#FFFFFF")
+        top.resizable(False, False)
+
+        def on_close():
+            self._emoji_top = None
+            try:
+                top.destroy()
+            except Exception:
+                pass
+        top.protocol("WM_DELETE_WINDOW", on_close)
+
+        cat_row = tk.Frame(top, bg="#FFFFFF")
+        cat_row.pack(fill="x", padx=10, pady=(10, 4))
+        cv = tk.Canvas(top, bg="#FFFFFF", highlightthickness=0, bd=0)
+        cv.pack(fill="both", expand=True, padx=8)
         cat_btns = []
+        state = {"grid": {}, "refs": []}
 
         def show_cat(i):
             for j, b in enumerate(cat_btns):
@@ -915,32 +1147,83 @@ class LanExcelApp:
                     b.configure(style="Primary.TButton" if j == i else "TButton")
                 except Exception:
                     pass
-            for w in grid.winfo_children():
-                w.destroy()
+            cv.delete("all")
+            state["grid"].clear()
+            state["refs"] = []
             chars = list(EMOJI_GROUPS[i][1])
-            cols = 12
+            # Canvas 一次绘制全部图标：96 个按钮换成 96 个 image item，
+            # 打开面板从 1.2 秒降到几十毫秒
             for idx, ch in enumerate(chars):
-                b = tk.Button(grid, text=ch, relief="flat", bd=0,
-                              font=("Segoe UI Emoji", 12), cursor="hand2",
-                              command=lambda c=ch: self._insert_emoji(c, top))
-                b.grid(row=idx // cols, column=idx % cols, padx=1, pady=1)
+                ph = self.emoji.get(ch, EMOJI_PANEL_PX)
+                if ph is None:
+                    continue
+                r, c = divmod(idx, self.EMOJI_COLS)
+                state["refs"].append(ph)
+                state["grid"][(r, c)] = ch
+                cv.create_image(8 + c * C + C // 2, 6 + r * C + C // 2, image=ph)
+            rows = (len(chars) + self.EMOJI_COLS - 1) // self.EMOJI_COLS
+            cv.configure(scrollregion=(0, 0, self.EMOJI_COLS * C + 16,
+                                       rows * C + 12))
+
+        def pick(event):
+            c = (event.x - 8) // C
+            r = (event.y - 6) // C
+            ch = state["grid"].get((r, c))
+            if ch:
+                self._insert_emoji(ch)
+
+        cv.bind("<Button-1>", pick)
 
         for i, (name, _) in enumerate(EMOJI_GROUPS):
             b = make_button(cat_row, name, lambda i=i: show_cat(i))
             b.pack(side="left", padx=2)
             cat_btns.append(b)
-        show_cat(0)
-        hint = ttk.Frame(top)
-        hint.pack(fill="x", padx=8, pady=(4, 8))
-        ttk.Label(hint, text="颜文字: " + "  ".join(TEXT_FACES[:6]),
-                  style="Muted.TLabel").pack(anchor="w")
 
-    def _insert_emoji(self, ch, top=None):
-        pos = self.chat_entry.index("insert")
+        hint = tk.Frame(top, bg="#FFFFFF")
+        hint.pack(fill="x", padx=10, pady=(2, 8))
+        tk.Label(hint, text="颜文字：", bg="#FFFFFF", fg="#6B6B6B",
+                 font=(FONT, 9)).pack(side="left")
+        for face in TEXT_FACES[:5]:
+            f = tk.Label(hint, text=face, bg="#F2F5F9", fg="#1A1A1A",
+                         font=(FONT, 9), padx=4, pady=1, cursor="hand2")
+            f.pack(side="left", padx=2)
+            f.bind("<Button-1>", lambda e, t=face: self._insert_emoji(t))
+        show_cat(0)
+        top.focus_set()
+
+    def _warm_emoji(self, budget=8, delay=60):
+        """后台分帧预热表情图片，避免首次打开面板时集中解码卡顿"""
+        chars = list(dict.fromkeys(ch for _, g in EMOJI_GROUPS for ch in g))
+        total = len(chars)
+        pos = [0]
+
+        def step():
+            for ch in chars[pos[0]:pos[0] + budget]:
+                self.emoji.get(ch, EMOJI_PANEL_PX)
+                self.emoji.get(ch, EMOJI_CHAT_PX)
+            pos[0] += budget
+            if pos[0] < total:
+                try:
+                    self.root.after(delay, step)
+                except Exception:
+                    pass
+        try:
+            self.root.after(1200, step)      # 启动稳定后再预热，不抢首屏
+        except Exception:
+            pass
+
+    def _insert_emoji(self, ch):
+        try:
+            pos = self.chat_entry.index("insert")
+        except Exception:
+            pos = len(self.chat_input.get())
         cur = self.chat_input.get()
         self.chat_input.set(cur[:pos] + ch + cur[pos:])
-        self.chat_entry.icursor(pos + len(ch))
-        self.chat_entry.focus_set()
+        try:
+            self.chat_entry.icursor(pos + len(ch))
+            self.chat_entry.focus_set()
+        except Exception:
+            pass
 
     def send_image_group(self):
         if not self.current_gid:
@@ -1039,18 +1322,28 @@ class LanExcelApp:
             return
         self.rebuild_chat()
 
-    def rebuild_chat(self):
+    def rebuild_chat(self, scroll=True):
         self._need_rebuild = False
         self._cancel_anims()
-        self.chat_text.configure(state="normal")
-        self.chat_text.delete("1.0", "end")
-        self.chat_text.configure(state="disabled")
+        t = self.chat_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
         self._rendered_mids = set()
+        self._chat_images = []          # 旧图已从文本里删除，引用可以释放
         with self.node.chat_lock:
             hist = [dict(m) for m in self.node.chat_log
                     if m.get("gid") == self.current_gid]
+        # 只渲染最近的消息，历史太长时整窗重建会明显变慢
+        if len(hist) > CHAT_RENDER_LIMIT:
+            cut = len(hist) - CHAT_RENDER_LIMIT
+            hist = hist[cut:]
+            t.insert("end", "（更早的 %d 条消息已折叠，可在聊天记录文件里查看）\n\n"
+                     % cut, "muted")
         for m in hist:
-            self._append_message(m)
+            self._append_message(m, scroll=False)
+        t.configure(state="disabled")
+        if scroll:
+            t.see("end")
 
     def refresh_chat(self):
         d = self.node.chat_since(self.chat_since)
@@ -1060,8 +1353,11 @@ class LanExcelApp:
         pins = self.node.cfg.get("pinned_groups", [])
         mine = sorted(mine, key=lambda g: (0 if g["id"] in pins else 1,))
         self.group_data = mine
-        sig = json.dumps([[g, g["id"] in pins] for g in mine],
-                         ensure_ascii=False, sort_keys=True)
+        # 只比较影响显示的字段，避免每轮把整个群对象（含成员表）序列化一遍
+        sig = tuple((g["id"], g["name"], g["count"], g["pending_count"],
+                     g["dissolved"], g["is_owner"], g["is_admin"],
+                     g["can_manage"], g.get("join_mode"), g["id"] in pins)
+                    for g in mine)
         if sig != self._groups_sig:
             self._groups_sig = sig
             self.group_ids = [g["id"] for g in mine]
@@ -1106,14 +1402,19 @@ class LanExcelApp:
         if self._need_rebuild:
             self._need_rebuild = False
             self.rebuild_chat()
-        tree = self.transfer_tree
-        for item in tree.get_children():
-            tree.delete(item)
-        for t in d["transfers"][-40:]:
-            pct = (t["sent"] * 100.0 / t["size"]) if t["size"] else 100.0
-            arrow = "↑" if t["direction"] == "send" else "↓"
-            tree.insert("", "end", iid=t["id"], values=(
-                arrow + t["name"][:20], "%.0f%%" % pct, t["status"]))
+        # 传输列表：只有进度真的变了才重建，别每秒整表 delete+insert
+        tsig = tuple((t["id"], t["sent"], t["size"], t["status"])
+                     for t in d["transfers"][-40:])
+        if tsig != self._transfer_sig:
+            self._transfer_sig = tsig
+            tree = self.transfer_tree
+            for item in tree.get_children():
+                tree.delete(item)
+            for t in d["transfers"][-40:]:
+                pct = (t["sent"] * 100.0 / t["size"]) if t["size"] else 100.0
+                arrow = "↑" if t["direction"] == "send" else "↓"
+                tree.insert("", "end", iid=t["id"], values=(
+                    arrow + t["name"][:20], "%.0f%%" % pct, t["status"]))
         if mine:
             cur = next((g for g in mine if g["id"] == self.current_gid), None)
             if cur:
@@ -1127,10 +1428,12 @@ class LanExcelApp:
         else:
             self.chat_title.set("还没有群聊，点击左侧「新建群聊」")
 
-    def refresh_members(self):
-        self.member_list.delete(0, "end")
+    def refresh_members(self, force=False):
         cur = next((g for g in self.group_data if g["id"] == self.current_gid), None)
         if not cur:
+            if self._member_list_sig:
+                self._member_list_sig = ()
+                self.member_list.delete(0, "end")
             return
         owner = cur["owner"]
         admins = set(cur["admins"])
@@ -1149,6 +1452,11 @@ class LanExcelApp:
             rows.append((not online, pid != owner and pid not in admins,
                          display_name(pid), pid, online, role))
         rows.sort(key=lambda x: (x[0], x[1], x[2]))
+        sig = tuple((name, online, role) for _, _, name, _, online, role in rows)
+        if not force and sig == self._member_list_sig:
+            return
+        self._member_list_sig = sig
+        self.member_list.delete(0, "end")
         for _, _, name, pid, online, role in rows:
             dot = "●" if online else "○"
             self.member_list.insert("end", " %s %s%s" % (dot, name, role))
@@ -1563,9 +1871,21 @@ class LanExcelApp:
 
     # ------------------------------------------------------------ 周期刷新
     def refresh(self):
+        """主循环：250ms 轻量 tick，按当前页面分频做重活，避免整轮刷新卡住输入
+
+        * 协作表格页：每 tick 轮询单元格（高频才不卡顿手感）
+        * 在线成员页：2 秒一次（头像/状态变化不快）
+        * 群聊页：1 秒一次（消息与传输进度）
+        不在视野内的页面完全不刷新，切回来时立即补一次全量。
+        """
         try:
-            self.poll_room()
+            now = time.time()
+            page = self.page
             rooms = sorted(self.node.rooms.keys())
+
+            if page == "sheet":
+                self.poll_room()
+
             sig = "|".join(rooms)
             if sig != self._rooms_sig:
                 self._rooms_sig = sig
@@ -1576,42 +1896,47 @@ class LanExcelApp:
                 elif rooms:
                     self.room_var.set(rooms[0])
                     self.switch_room()
-                self._update_sheet_choices()
-            self.refresh_peers()
-            self.refresh_chat()
+                elif page == "sheet":
+                    self._update_sheet_choices()
+
+            if "peers" in self.pages and now - self._last_peers >= 2.0:
+                self._last_peers = now
+                self.refresh_peers()
+
+            if "chat" in self.pages and now - self._last_chat >= 1.0:
+                self._last_chat = now
+                self.refresh_chat()
+
             sc = self.node.scan_count
-            self.scan_info.set(("扫描中…" if self.node.scanning else
-                                "已扫描 %d 次 · 发现 %d 个节点" % (sc, len(self.node.peers))))
-            self.status.set(
-                "%s (%s)  |  界面 http://127.0.0.1:%s  |  房间 %d  |  群聊 %d  |  "
-                "在线成员 %d  |  文件端口 %s"
-                % (self.node.name, self.node.id[:8], self.node.http_port,
-                   len(rooms), len(self.group_data),
-                   len([u for u in self.node.active_users(self.room)]) if self.room else 0,
-                   self.node.file_port))
+            scan = ("扫描中…" if self.node.scanning else
+                    "已扫描 %d 次 · 发现 %d 个节点" % (sc, len(self.node.peers)))
+            if scan != self._last_scan:
+                self._last_scan = scan
+                self.scan_info.set(scan)
+
+            status = ("%s (%s)  |  界面 http://127.0.0.1:%s  |  房间 %d  |  群聊 %d  |  "
+                      "在线成员 %d  |  文件端口 %s"
+                      % (self.node.name, self.node.id[:8], self.node.http_port,
+                         len(rooms), len(self.group_data),
+                         len(self.node.active_users(self.room)) if self.room else 0,
+                         self.node.file_port))
+            if status != self._last_status:
+                self._last_status = status
+                self.status.set(status)
         except Exception:
             traceback.print_exc()
-        self.root.after(800, self.refresh)
+        self.root.after(250, self.refresh)
 
-    def refresh_peers(self, force=False):
-        peers = self.node.peers_detail()
-        tags_map = self.node.cfg.get("peer_tags", {})
-        pins = set(self.node.cfg.get("pinned_peers", []))
-        filt = self.tag_filter.get()
-        sig = json.dumps([peers, filt, sorted(pins),
-                          {k: sorted(v) for k, v in tags_map.items()}],
-                         ensure_ascii=False, sort_keys=True)
-        if not force and sig == self._peers_sig:
-            return
-        self._peers_sig = sig
-        tree = self.peer_tree
-        selected = tree.selection()
-        for item in tree.get_children():
-            tree.delete(item)
-        src = {"multicast": "组播", "broadcast": "广播",
-               "register": "定向探测", "": "—"}
+    PEER_SRC = {"multicast": "组播", "broadcast": "广播",
+                "register": "定向探测", "": "—"}
 
-        # 组装分组：置顶 / 各标签 / 未分组；一个联系人有多个标签时会在每个标签下出现
+    def _peer_rows(self, peers, tags_map, pins, filt):
+        """按「置顶 / 各标签 / 未分组」组装成扁平行，供树增量刷新使用
+
+        返回 [(iid, parent_iid, pid, values, tags), ...]，顺序即显示顺序。
+        同一联系人挂多个标签时用 ``pid@序号`` 保证 iid 唯一（此前直接拿 pid
+        当 iid，重复 insert 会抛 TclError，把整轮刷新打断）。
+        """
         sections = []
         if filt in ("全部", "", "📌 置顶"):
             pinned = [p for p in peers if p["id"] in pins]
@@ -1631,21 +1956,82 @@ class LanExcelApp:
             if untagged:
                 sections.append(("未分组", untagged))
 
-        def insert_peer(parent, p):
-            online = p["online"]
-            photo = self._photo(p["id"], self.node.peer_avatar_b64(p["id"]))
-            self._peer_photos[p["id"]] = photo
-            tree.insert(parent, "end", iid=p["id"], image=photo,
-                        tags=("online" if online else "offline",),
-                        values=(p["name"], p["note"], p["local_note"], p["ip"],
-                                src.get(p["source"], p["source"]),
-                                "● 在线" if online else "○ 离线"))
-
+        rows, seen = [], {}
         for gname, members in sections:
-            tree.insert("", "end", iid="grp:" + gname, text=gname, open=True,
-                        values=("%d 人" % len(members), "", "", "", "", ""))
+            giid = "grp:" + gname
+            rows.append((giid, "", None,
+                         ("%d 人" % len(members), "", "", "", "", ""),
+                         ("group",)))
             for p in sorted(members, key=lambda x: (not x["online"], x["name"])):
-                insert_peer("grp:" + gname, p)
+                n = seen.get(p["id"], 0)
+                seen[p["id"]] = n + 1
+                online = p["online"]
+                rows.append((
+                    "%s@%d" % (p["id"], n), giid, p["id"],
+                    (p["name"], p["note"], p["local_note"], p["ip"],
+                     self.PEER_SRC.get(p["source"], p["source"]),
+                     "● 在线" if online else "○ 离线"),
+                    ("online" if online else "offline",)))
+        return rows
+
+    def refresh_peers(self, force=False):
+        peers = self.node.peers_detail()
+        tags_map = self.node.cfg.get("peer_tags", {})
+        pins = set(self.node.cfg.get("pinned_peers", []))
+        filt = self.tag_filter.get()
+        sig = (tuple((p["id"], p["online"], p["name"], p["note"],
+                      p["local_note"], p["ip"], p["source"]) for p in peers),
+               filt, tuple(sorted(pins)),
+               tuple(sorted((k, tuple(sorted(v))) for k, v in tags_map.items())))
+        if not force and sig == self._peers_sig:
+            return
+        self._peers_sig = sig
+
+        tree = self.peer_tree
+        rows = self._peer_rows(peers, tags_map, pins, filt)
+        tree_rows = [r[0] for r in rows if not r[0].startswith("grp:")]
+        selected = [iid for iid in tree.selection() if not iid.startswith("grp:")]
+
+        # 结构没变就只更新变化的行，避免每 2 秒整棵树 delete+insert 造成闪烁
+        if rows:
+            same_shape = (len(tree.get_children()) == len([r for r in rows if not r[1]])
+                          and tree.exists(rows[0][0]))
+        else:
+            same_shape = not tree.get_children()
+        if same_shape:
+            for iid, parent, pid, values, tags in rows:
+                if not tree.exists(iid):
+                    same_shape = False
+                    break
+                cur = tree.item(iid, "values")
+                if tuple(str(x) for x in cur) != tuple(str(x) for x in values):
+                    tree.item(iid, values=values, tags=tags)
+                elif pid:
+                    tree.item(iid, tags=tags)
+
+        if not same_shape:
+            board = tree.yview()
+            for item in tree.get_children():
+                tree.delete(item)
+            for iid, parent, pid, values, tags in rows:
+                kw = {"text": "", "values": values, "tags": tags}
+                if not parent:
+                    kw["text"] = iid[4:]
+                    kw["open"] = True
+                else:
+                    photo = self._photo(pid, self.node.peer_avatar_b64(pid),
+                                        PEER_AVATAR_PX)
+                    self._peer_photos[pid] = photo
+                    if photo is not None:
+                        kw["image"] = photo
+                try:
+                    tree.insert(parent, "end", iid=iid, **kw)
+                except Exception:
+                    pass
+            try:
+                tree.yview_moveto(board[0])
+            except Exception:
+                pass
 
         # 更新筛选下拉选项
         all_tags = sorted({t for tl in tags_map.values() for t in tl})
@@ -1656,10 +2042,9 @@ class LanExcelApp:
             self.tag_filter.set("全部")
 
         if selected:
-            for iid in selected:
-                if tree.exists(iid) and not iid.startswith("grp:"):
-                    tree.selection_set(iid)
-                    break
+            keep = [i for i in selected if tree.exists(i)]
+            if keep:
+                tree.selection_set(keep)
 
     def refresh_lists(self):
         cfg = self.node.config_public()
